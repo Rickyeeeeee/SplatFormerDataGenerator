@@ -803,17 +803,6 @@ def render_object(
                 cam_empty.rotation_euler[2] += math.radians(stepsize) #for the next view
             elif split=='test' and i%len(elevations)==len(elevations)-1:
                 cam_empty.rotation_euler[2] += math.radians(stepsize)
-            #read the first image
-            if True and i==0 and 'train' in split:
-                if args.generate_trainset:
-                    file_path = os.path.join(os.path.abspath(args.output_folder),'images','train_000.png')
-                else:
-                    file_path = os.path.join(os.path.abspath(args.output_folder),split.split('_')[-1],'images','train_000.png')
-                if load_image_and_check(file_path)==False:
-                    import shutil
-                    print(args.output_folder)
-                    shutil.rmtree(os.path.abspath(args.output_folder))
-                    exit()
 
     if not args.generate_trainset:
         for key, lines in f_images_lines.items():
