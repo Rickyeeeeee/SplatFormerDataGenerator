@@ -4,6 +4,6 @@ blender-2.90.0-linux64/blender --background --python render_shapenet.py  \
     -- --object_path=${PATH_TO_SHAPENET}/${obj_id}/models/model_normalized.obj \
     --output_folder=render_outputs/shapenet/trainset/${obj_id} \
     --train_elevation_sin_amplitude_max_levels=10 \
-    --test_num_per_floor=2 \
+    --test_num_per_floor=3 \
     --test_elevation_range=70-90 \
     --generate_trainset  --use_gpu
