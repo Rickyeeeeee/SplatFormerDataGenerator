@@ -5,6 +5,7 @@ import os
 import re
 import subprocess
 import sys
+import shutil
 from pathlib import Path
 
 # Local config
@@ -68,6 +69,7 @@ if overlap:
     )
     sys.exit(1)
 
+# Auto-select GPU
 try:
     result = subprocess.run(
         [
@@ -102,7 +104,7 @@ env = dict(os.environ)
 env['CUDA_VISIBLE_DEVICES'] = gpu_id
 
 if not PATH_TO_OBJAVERSE.is_dir():
-    print(f'[ERROR] PATH_TO_OBJAVERSE does not exist or is not a directory: {PATH_TO_OBJAVERSE}')
+    print(f'[ERROR] PATH_TO_OBJAVERSE does not exist: {PATH_TO_OBJAVERSE}')
     sys.exit(1)
 
 glb_paths = sorted(PATH_TO_OBJAVERSE.glob('*.glb'))
@@ -119,21 +121,21 @@ for obj_path in glb_paths:
         split_name = 'test'
         split_root = TEST_SET_ROOT
     else:
-        print(f'[SKIP] {obj_id}: not in train/test split.')
+        print(f'[SKIP] {obj_id}: not in split.')
         continue
 
     obj_output_dir = split_root / 'colmap' / obj_id
     images_dir = obj_output_dir / 'images'
 
-    print(f'Processing {obj_id} ({split_name})')
+    print(f'\n=== Processing {obj_id} ({split_name}) ===')
 
     # Blender rendering
     image_count = 0
     if images_dir.is_dir():
-        image_count = sum(1 for p in images_dir.iterdir() if p.is_file() and p.suffix == '.png')
+        image_count = sum(1 for p in images_dir.iterdir() if p.suffix == '.png')
 
     if image_count >= NUM_VIEWS:
-        print(f'[SKIP] {obj_id}: found {image_count} images in {images_dir}, skipping render.')
+        print(f'[SKIP] Render exists: {image_count} images')
     else:
         render_cmd = [
             OBJAVERSE_BLENDER_BIN,
@@ -150,7 +152,7 @@ for obj_path in glb_paths:
             '--test_num_per_floor=3',
             '--use_gpu',
         ]
-        print("Running command:")
+        print("Running render:")
         print(" ".join(render_cmd))
         subprocess.run(render_cmd, env=env, check=True)
 
@@ -178,7 +180,7 @@ for obj_path in glb_paths:
             f'--experiment-name={experiment_dir}',
             '--relative-model-dir=nerfstudio_models',
             '--vis',
-            'viewer+tensorboard',
+            'tensorboard',
             '--steps_per_eval_image=100000',
             '--steps_per_eval_all_images=1000000',
             '--max_num_iterations=30000',
@@ -209,4 +211,48 @@ for obj_path in glb_paths:
             '--assume_colmap_world_coordinate_convention',
             'False',
         ]
-        subprocess.run(train_cmd, env=env, check=True)
+
+        print(f"\n[TRAIN] {experiment_dir}")
+        print(" ".join(train_cmd))
+
+        try:
+            process = subprocess.Popen(
+                train_cmd,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+
+            full_output = []
+
+            # 🔥 stream line-by-line (real-time)
+            for line in process.stdout:
+                print(line, end="")         # <-- keeps original behavior
+                full_output.append(line)    # <-- also store for checking
+
+            process.wait()
+
+            if process.returncode != 0:
+                raise subprocess.CalledProcessError(
+                    process.returncode,
+                    train_cmd,
+                    output="".join(full_output)
+                )
+
+        except subprocess.CalledProcessError as e:
+            output = e.output or ""
+
+            print(f"[ERROR] Training failed for {experiment_dir}")
+
+            # 🔥 Detect your specific failure
+            if "Invalid shape for means3d" in output:
+                print(f"[CLEANUP] Removing nerfstudio outputs for {obj_id}")
+
+                scene_output_dir = output_dir / obj_id
+                if scene_output_dir.exists():
+                    shutil.rmtree(scene_output_dir, ignore_errors=True)
+
+                print(f"[SKIP] {obj_id} due to invalid Gaussians")
+                break  # skip remaining df
