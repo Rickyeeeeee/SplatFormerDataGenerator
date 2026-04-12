@@ -14,6 +14,7 @@ TRAIN_SET_ROOT = Path('/project/ricky/splatformer-data/train-set-512/objaverse')
 TEST_SET_ROOT = Path('/project/ricky/splatformer-data/test-set-512/objaverse')
 OBJAVERSE_TRAIN_SPLIT_FILE = Path('./traintest_splits/objaverse_train.txt')
 OBFAVERSE_TEST_SPLIT_FILE = Path('./traintest_splits/objaverse_test.txt')
+OBJAVERSE_FAILED_SPLIT_FILE = Path('./traintest_splits/objaverse_failed.txt')
 OBJAVERSE_BLENDER_BIN = 'blender-3.2.2-linux-x64/blender'
 RENDER_SCRIPT = 'render_full.py'
 NUM_VIEWS = 128
@@ -59,6 +60,14 @@ with OBFAVERSE_TEST_SPLIT_FILE.open('r', encoding='utf-8') as f:
         obj_id = line.strip()
         if obj_id:
             test_ids.add(obj_id)
+
+failed_ids = set()
+if OBJAVERSE_FAILED_SPLIT_FILE.exists():
+    with OBJAVERSE_FAILED_SPLIT_FILE.open('r', encoding='utf-8') as f:
+        for line in f:
+            obj_id = line.strip()
+            if obj_id:
+                failed_ids.add(obj_id)
 
 overlap = train_ids.intersection(test_ids)
 if overlap:
@@ -109,9 +118,23 @@ if not PATH_TO_OBJAVERSE.is_dir():
 
 glb_paths = sorted(PATH_TO_OBJAVERSE.glob('*.glb'))
 
+
+def mark_failed_scene(obj_id):
+    if obj_id in failed_ids:
+        return
+    OBJAVERSE_FAILED_SPLIT_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with OBJAVERSE_FAILED_SPLIT_FILE.open('a', encoding='utf-8') as f:
+        f.write(f'{obj_id}\n')
+    failed_ids.add(obj_id)
+    print(f'[FAILED] Added {obj_id} to {OBJAVERSE_FAILED_SPLIT_FILE}')
+
 # Main Loop
 for obj_path in glb_paths:
     obj_id = obj_path.stem
+
+    if obj_id in failed_ids:
+        print(f'[SKIP] {obj_id}: listed in failed scenes.')
+        continue
 
     # Train/Test split
     if obj_id in train_ids:
@@ -174,6 +197,8 @@ for obj_path in glb_paths:
             f'--pipeline.datamanager.data={colmap_dir}',
             '--pipeline.model.sh_degree=1',
             '--pipeline.save_img=False',
+            '--pipeline.datamanager.images-on-gpu=True',
+            '--pipeline.datamanager.cache-images=gpu',
             '--test_after_train',
             'True',
             f'--output_dir={output_dir}',
@@ -244,11 +269,13 @@ for obj_path in glb_paths:
         except subprocess.CalledProcessError as e:
             output = e.output or ""
 
-            print(f"[ERROR] Training failed for {experiment_dir}")
 
             # 🔥 Detect your specific failure
             if "Invalid shape for means3d" in output:
                 print(f"[CLEANUP] Removing nerfstudio outputs for {obj_id}")
+
+                print(f"[ERROR] Training failed for {experiment_dir}")
+                mark_failed_scene(obj_id)
 
                 scene_output_dir = output_dir / obj_id
                 if scene_output_dir.exists():
