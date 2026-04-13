@@ -205,7 +205,7 @@ for obj_path in glb_paths:
             f'--experiment-name={experiment_dir}',
             '--relative-model-dir=nerfstudio_models',
             '--vis',
-            'tensorboard',
+            'viewer',
             '--steps_per_eval_image=100000',
             '--steps_per_eval_all_images=1000000',
             '--max_num_iterations=30000',
