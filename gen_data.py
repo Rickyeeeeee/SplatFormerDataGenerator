@@ -10,8 +10,8 @@ from pathlib import Path
 
 # Local config
 OBJAVERSE_GLBS_ROOT = Path('/project/ricky/objaverse/glbs')
-TRAIN_SET_ROOT = Path('/project/ricky/splatformer-data/train-set-512/objaverse')
-TEST_SET_ROOT = Path('/project/ricky/splatformer-data/test-set-512/objaverse')
+TRAIN_SET_ROOT = Path('/project2/ricky/splatformer-data/train-set-512/objaverse')
+TEST_SET_ROOT = Path('/project2/ricky/splatformer-data/test-set-512/objaverse')
 OBJAVERSE_TRAIN_SPLIT_FILE = Path('./traintest_splits/objaverse_train.txt')
 OBFAVERSE_TEST_SPLIT_FILE = Path('./traintest_splits/objaverse_test.txt')
 OBJAVERSE_FAILED_SPLIT_FILE = Path('./traintest_splits/objaverse_failed.txt')
