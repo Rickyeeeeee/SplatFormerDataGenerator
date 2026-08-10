@@ -19,7 +19,7 @@ RENDER_SCRIPT = 'render_full.py'
 NUM_VIEWS = 128
 DEFAULT_RESOLUTIONS = [512, 128]
 # DEFAULT_RESOLUTIONS = [512, 256, 128]
-CHECKPOINT_NAME = 'step-000010001.ckpt'
+CHECKPOINT_NAME = 'step-000015001.ckpt'
 
 
 def parse_args():
@@ -144,6 +144,7 @@ def build_train_command(colmap_dir, output_dir, obj_id):
         '--pipeline.save_img=False',
         '--pipeline.datamanager.images-on-gpu=True',
         '--pipeline.datamanager.cache-images=gpu',
+        '--pipeline.model.stop-split-at=10000',
         '--test_after_train',
         'True',
         f'--output_dir={output_dir}',

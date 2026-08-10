@@ -13,7 +13,7 @@ OBJAVERSE_GLBS_ROOT = Path('/project/ricky/objaverse/glbs')
 TRAIN_SET_ROOT = Path('/project2/ricky/splatformer-data/train-set-512/objaverse')
 TEST_SET_ROOT = Path('/project2/ricky/splatformer-data/test-set-512/objaverse')
 OBJAVERSE_TRAIN_SPLIT_FILE = Path('./traintest_splits/objaverse_train.txt')
-OBFAVERSE_TEST_SPLIT_FILE = Path('./traintest_splits/objaverse_test.txt')
+OBFAVERSE_TEST_SPLIT_FILE = Path('./traintest_splits/objaverse_test copy.txt')
 OBJAVERSE_FAILED_SPLIT_FILE = Path('./traintest_splits/objaverse_failed.txt')
 OBJAVERSE_BLENDER_BIN = 'blender-3.2.2-linux-x64/blender'
 RENDER_SCRIPT = 'render_full.py'
@@ -185,8 +185,8 @@ for obj_path in glb_paths:
     # Nerfstudio training
     for df in [1, 2, 4]:
         experiment_dir = f'{obj_id}/df-{df}'
-        print(output_dir / experiment_dir / 'splatfacto' / 'nerfstudio_models' / 'step-000010001.ckpt')
-        if os.path.exists(output_dir / experiment_dir / 'splatfacto' / 'nerfstudio_models' / 'step-000010001.ckpt'):
+        print(output_dir / experiment_dir / 'splatfacto' / 'nerfstudio_models' / 'step-000015001.ckpt')
+        if os.path.exists(output_dir / experiment_dir / 'splatfacto' / 'nerfstudio_models' / 'step-000015001.ckpt'):
             print(f"Skipping {experiment_dir}, already exists...")
             continue
         train_cmd = [
@@ -199,6 +199,7 @@ for obj_path in glb_paths:
             '--pipeline.save_img=False',
             '--pipeline.datamanager.images-on-gpu=True',
             '--pipeline.datamanager.cache-images=gpu',
+            '--pipeline.model.stop-split-at=10000',
             '--test_after_train',
             'True',
             f'--output_dir={output_dir}',
@@ -214,7 +215,7 @@ for obj_path in glb_paths:
             '--steps_per_save=100000',
             '--save_last_checkpoint',
             'True',
-            '--early_stop_steps=10000',
+            '--early_stop_steps=15000',
             '--save_only_gs_params',
             'True',
             '--viewer.quit-on-train-completion',
