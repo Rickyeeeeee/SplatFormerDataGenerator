@@ -10,8 +10,8 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).resolve().parent
 
 OBJAVERSE_GLBS_ROOT = Path('/project/ricky/objaverse/glbs')
-TRAIN_SET_ROOT = Path('/project/ricky/splatformer-data-new/train-set/objaverse')
-TEST_SET_ROOT = Path('/project/ricky/splatformer-data-new/test-set/objaverse')
+TRAIN_SET_ROOT = Path('/project/ricky/splatformer-sr-data/train-set/objaverse')
+TEST_SET_ROOT = Path('/project/ricky/splatformer-sr-data/test-set/objaverse')
 OBJAVERSE_TRAIN_SPLIT_FILE = SCRIPT_DIR / 'traintest_splits' / 'objaverse_train.txt'
 OBJAVERSE_TEST_SPLIT_FILE = SCRIPT_DIR / 'traintest_splits' / 'objaverse_test.txt'
 OBJAVERSE_FAILED_SPLIT_FILE = SCRIPT_DIR / 'traintest_splits' / 'objaverse_failed.txt'

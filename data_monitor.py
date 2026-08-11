@@ -19,7 +19,7 @@ from utils.transform_utils import MinMaxScaler
 
 DEFAULT_RESOLUTIONS = (512, 256, 128)
 EXPECTED_IMAGE_COUNT = 128
-CKPT_RELATIVE_PATH = Path("splatfacto/nerfstudio_models/step-000010001.ckpt")
+CKPT_RELATIVE_PATH = Path("splatfacto/nerfstudio_models/step-000015001.ckpt")
 CAMERA_METADATA_NAME = "camera_for-3d-denoise.pkl"
 OUTPUT_COLUMNS = [
     "scene",
@@ -43,7 +43,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dataset_root",
         type=Path,
-        default="/project/ricky/splatformer-data-new/train-set/objaverse/",
+        default="/project/ricky/splatformer-sr-data/train-set/objaverse/",
         help=(
             "Root containing <resolution>/colmap and <resolution>/nerfstudio "
             "directories."
