@@ -4,6 +4,19 @@ This repository is used by [SplatFormer](https://github.com/ChenYutongTHU/SplatF
 * The nerfstudio script to train 3DGS on the rendered OOD-NVS sets.
 You can also download **the prepared test set** [here](https://drive.google.com/file/d/1-mUCl-yxe1aE0rrQDHKlXk1J2n8d1-60/view?usp=sharing). 
 
+## 1. GSplat Installation
+```bash
+conda create -n datagenerator-gsplat python=3.8 -y
+conda activate datagenerator-gsplat
+
+# Install the pytorch version for your cuda version.
+pip install torch==2.1.2 torchvision==0.16.2 torchaudio==2.1.2 --index-url https://download.pytorch.org/whl/cu118
+
+# Install gsplat
+pip install gsplat==1.5.3 
+pip install -r requirements.txt
+```
+
 ## 1. Installation
 ### Blender (for render)
 ```
