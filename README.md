@@ -15,6 +15,8 @@ pip install torch==2.1.2 torchvision==0.16.2 torchaudio==2.1.2 --index-url https
 # Install gsplat
 pip install gsplat==1.5.3 
 pip install -r requirements.txt
+cd ./pycolmap
+python setup.py install
 ```
 
 ## 1. Installation
