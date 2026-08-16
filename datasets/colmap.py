@@ -408,11 +408,13 @@ class Dataset:
         split: str = "train",
         patch_size: Optional[int] = None,
         load_depths: bool = False,
+        alpha_aware: bool = False,
     ):
         self.parser = parser
         self.split = split
         self.patch_size = patch_size
         self.load_depths = load_depths
+        self.alpha_aware = alpha_aware
         indices = np.arange(len(self.parser.image_names))
         if split == "train":
             if self.parser.test_every != -1:
@@ -430,7 +432,7 @@ class Dataset:
 
     def __getitem__(self, item: int) -> Dict[str, Any]:
         index = self.indices[item]
-        image = imageio.imread(self.parser.image_paths[index])[..., :3]
+        image = imageio.imread(self.parser.image_paths[index])
         camera_id = self.parser.camera_ids[index]
         K = self.parser.Ks_dict[camera_id].copy()  # undistorted K
         params = self.parser.params_dict[camera_id]
@@ -456,12 +458,21 @@ class Dataset:
             K[0, 2] -= x
             K[1, 2] -= y
 
+        if self.alpha_aware:
+            if image.shape[-1] == 4:
+                alpha = image[..., 3:4]
+            else:
+                alpha = np.full((*image.shape[:2], 1), 255, dtype=image.dtype)
+        image = image[..., :3]
+
         data = {
             "K": torch.from_numpy(K).float(),
             "camtoworld": torch.from_numpy(camtoworlds).float(),
             "image": torch.from_numpy(image).float(),
             "image_id": item,  # the index of the image in the dataset
         }
+        if self.alpha_aware:
+            data["alpha"] = torch.from_numpy(alpha).float()
         if mask is not None:
             data["mask"] = torch.from_numpy(mask).bool()
 

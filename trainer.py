@@ -124,6 +124,9 @@ class Config:
 
     # Use random background for training to discourage transparency
     random_bkgd: bool = False
+    # Preserve image alpha and composite predictions and ground truth onto the
+    # same background during training and evaluation.
+    alpha_aware: bool = False
 
     # LR for 3D point positions
     means_lr: float = 1.6e-4
@@ -324,9 +327,10 @@ class Runner:
         self.stats_dir = f"{cfg.result_dir}/stats"
         os.makedirs(self.stats_dir, exist_ok=True)
         self.render_dir = f"{cfg.result_dir}/renders"
-        os.makedirs(self.render_dir, exist_ok=True)
+        # os.makedirs(self.render_dir, exist_ok=True)
         self.ply_dir = f"{cfg.result_dir}/ply"
-        os.makedirs(self.ply_dir, exist_ok=True)
+        if cfg.save_ply:
+            os.makedirs(self.ply_dir, exist_ok=True)
 
         # Tensorboard
         if cfg.tb_every != 0:
@@ -346,8 +350,11 @@ class Runner:
             split="train",
             patch_size=cfg.patch_size,
             load_depths=cfg.depth_loss,
+            alpha_aware=cfg.alpha_aware,
         )
-        self.valset = Dataset(self.parser, split="val")
+        self.valset = Dataset(
+            self.parser, split="val", alpha_aware=cfg.alpha_aware
+        )
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
         print("Scene scale:", self.scene_scale)
 
@@ -594,6 +601,9 @@ class Runner:
             camtoworlds = camtoworlds_gt = data["camtoworld"].to(device)  # [1, 4, 4]
             Ks = data["K"].to(device)  # [1, 3, 3]
             pixels = data["image"].to(device) / 255.0  # [1, H, W, 3]
+            gt_alpha = (
+                data["alpha"].to(device) / 255.0 if cfg.alpha_aware else None
+            )
             num_train_rays_per_step = (
                 pixels.shape[0] * pixels.shape[1] * pixels.shape[2]
             )
@@ -641,11 +651,14 @@ class Runner:
                     image_ids.unsqueeze(-1),
                 )["rgb"]
 
-            if cfg.random_bkgd:
-                bkgd = torch.rand(1, 3, device=device)
-                colors = colors + bkgd * (1.0 - alphas)
-            else:
-                colors = colors + 0.0 * (1.0 - alphas)
+            bkgd = (
+                torch.rand(1, 3, device=device)
+                if cfg.random_bkgd
+                else torch.zeros(1, 3, device=device)
+            )
+            colors = colors + bkgd * (1.0 - alphas)
+            if gt_alpha is not None:
+                pixels = pixels * gt_alpha + bkgd * (1.0 - gt_alpha)
 
             self.cfg.strategy.step_pre_backward(
                 params=self.splats,
@@ -883,12 +896,16 @@ class Runner:
             camtoworlds = data["camtoworld"].to(device)
             Ks = data["K"].to(device)
             pixels = data["image"].to(device) / 255.0
+            if cfg.alpha_aware:
+                gt_alpha = data["alpha"].to(device) / 255.0
+                # Evaluation uses a black background, matching Nerfstudio.
+                pixels = pixels * gt_alpha
             masks = data["mask"].to(device) if "mask" in data else None
             height, width = pixels.shape[1:3]
 
             torch.cuda.synchronize()
             tic = time.time()
-            colors, _, _ = self.rasterize_splats(
+            colors, alphas, _ = self.rasterize_splats(
                 camtoworlds=camtoworlds,
                 Ks=Ks,
                 width=width,
@@ -898,6 +915,8 @@ class Runner:
                 far_plane=cfg.far_plane,
                 masks=masks,
             )  # [1, H, W, 3]
+            # Explicitly composite the render onto the black eval background.
+            colors = colors + 0.0 * (1.0 - alphas)
             torch.cuda.synchronize()
             ellipse_time += max(time.time() - tic, 1e-10)
 
@@ -908,10 +927,10 @@ class Runner:
                 # write images
                 canvas = torch.cat(canvas_list, dim=2).squeeze(0).cpu().numpy()
                 canvas = (canvas * 255).astype(np.uint8)
-                imageio.imwrite(
-                    f"{self.render_dir}/{stage}_step{step}_{i:04d}.png",
-                    canvas,
-                )
+                # imageio.imwrite(
+                #     f"{self.render_dir}/{stage}_step{step}_{i:04d}.png",
+                #     canvas,
+                # )
 
                 pixels_p = pixels.permute(0, 3, 1, 2)  # [1, 3, H, W]
                 colors_p = colors.permute(0, 3, 1, 2)  # [1, 3, H, W]

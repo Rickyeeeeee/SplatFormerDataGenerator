@@ -19,7 +19,7 @@ RENDER_SCRIPT = 'render_full.py'
 NUM_VIEWS = 128
 DEFAULT_RESOLUTIONS = [512, 128]
 # DEFAULT_RESOLUTIONS = [512, 256, 128]
-CHECKPOINT_NAME = 'step-000015001.ckpt'
+CHECKPOINT_NAME = 'ckpt_14999_rank0.pt'
 
 
 def parse_args():
@@ -146,6 +146,9 @@ def build_train_command(colmap_dir, output_dir, obj_id):
         '--max-steps=15000',
         '--eval-steps=15000',
         '--save-steps=15000',
+        # '--save-ply',
+        # '--ply-steps=15000',
+        '--alpha-aware',
         '--disable-video',
         '--init-type=sfm',
         '--load-bbox',
@@ -155,6 +158,8 @@ def build_train_command(colmap_dir, output_dir, obj_id):
         '--tb-every=0',
         '--strategy.refine-stop-iter=10000',
         '--strategy.prune-opa=0.1',
+        # '--strategy.absgrad',
+        # '--strategy.grow-grad2d=0.0008',
         '--strategy.no-verbose',
     ]
 
@@ -270,9 +275,7 @@ def main():
 
             checkpoint_path = (
                 output_dir
-                / obj_id
-                / 'splatfacto'
-                / 'nerfstudio_models'
+                / 'ckpts'
                 / CHECKPOINT_NAME
             )
             print(checkpoint_path)
@@ -312,7 +315,7 @@ def main():
                     print(f'[SKIP] {obj_id} due to invalid Gaussians')
                     invalid_gaussians = True
                     break
-            exit()
+        exit()
 
         if invalid_gaussians:
             continue
