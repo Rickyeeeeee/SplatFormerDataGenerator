@@ -62,6 +62,8 @@ class Parser:
         factor: int = 1,
         normalize: bool = False,
         test_every: int = 8,
+        load_bbox: bool = False,
+        num_points_from_bbox: int = 50_000,
     ):
         self.data_dir = data_dir
         self.factor = factor
@@ -75,10 +77,34 @@ class Parser:
             colmap_dir
         ), f"COLMAP directory {colmap_dir} does not exist."
 
+        bbox_file = os.path.join(colmap_dir, "bbox.txt")
+        self.bbox = None
+        if load_bbox and num_points_from_bbox <= 0:
+            raise ValueError("num_points_from_bbox must be greater than zero.")
+        if load_bbox and not os.path.exists(bbox_file):
+            raise FileNotFoundError(
+                f"load_bbox is enabled, but {bbox_file} does not exist."
+            )
+        if load_bbox:
+            bbox = np.loadtxt(bbox_file, dtype=np.float32)
+            if bbox.shape != (2, 3):
+                raise ValueError(
+                    f"Bounding box {bbox_file} must contain two rows of three values."
+                )
+            if not np.all(np.isfinite(bbox)):
+                raise ValueError(f"Bounding box {bbox_file} contains non-finite values.")
+            if np.any(bbox[1] <= bbox[0]):
+                raise ValueError(
+                    f"Bounding box {bbox_file} maximum must exceed its minimum "
+                    "on every axis."
+                )
+            self.bbox = bbox
+
         manager = SceneManager(colmap_dir)
         manager.load_cameras()
         manager.load_images()
-        manager.load_points3D()
+        if not load_bbox:
+            manager.load_points3D()
 
         # Extract extrinsic matrices in world-to-camera format.
         imdata = manager.images
@@ -198,21 +224,44 @@ class Parser:
         colmap_to_image = dict(zip(colmap_files, image_files))
         image_paths = [os.path.join(image_dir, colmap_to_image[f]) for f in image_names]
 
-        # 3D points and {image_name -> [point_idx]}
-        points = manager.points3D.astype(np.float32)
-        points_err = manager.point3D_errors.astype(np.float32)
-        points_rgb = manager.point3D_colors.astype(np.uint8)
-        point_indices = dict()
+        # 3D seed points and {image_name -> [point_idx]}.
+        if load_bbox:
+            assert self.bbox is not None
+            # Sample in the original dataset frame. Normalization below applies
+            # the same transform to these points and the cameras.
+            points = np.random.uniform(
+                low=self.bbox[0],
+                high=self.bbox[1],
+                size=(num_points_from_bbox, 3),
+            ).astype(np.float32)
+            # Match Nerfstudio's neutral-gray bbox seed colors.
+            points_rgb = np.full(
+                (num_points_from_bbox, 3), 128, dtype=np.uint8
+            )
+            points_err = np.zeros(num_points_from_bbox, dtype=np.float32)
+            # Bbox samples have no COLMAP 2D observation tracks.
+            point_indices = {
+                image_name: np.empty(0, dtype=np.int32)
+                for image_name in image_names
+            }
+        else:
+            points = manager.points3D.astype(np.float32)
+            points_err = manager.point3D_errors.astype(np.float32)
+            points_rgb = manager.point3D_colors.astype(np.uint8)
+            point_indices = dict()
 
-        image_id_to_name = {v: k for k, v in manager.name_to_image_id.items()}
-        for point_id, data in manager.point3D_id_to_images.items():
-            for image_id, _ in data:
-                image_name = image_id_to_name[image_id]
-                point_idx = manager.point3D_id_to_point3D_idx[point_id]
-                point_indices.setdefault(image_name, []).append(point_idx)
-        point_indices = {
-            k: np.array(v).astype(np.int32) for k, v in point_indices.items()
-        }
+            image_id_to_name = {
+                v: k for k, v in manager.name_to_image_id.items()
+            }
+            for point_id, data in manager.point3D_id_to_images.items():
+                for image_id, _ in data:
+                    image_name = image_id_to_name[image_id]
+                    point_idx = manager.point3D_id_to_point3D_idx[point_id]
+                    point_indices.setdefault(image_name, []).append(point_idx)
+            point_indices = {
+                k: np.array(v).astype(np.int32)
+                for k, v in point_indices.items()
+            }
 
         # Normalize the world space.
         if normalize:
@@ -220,28 +269,30 @@ class Parser:
             camtoworlds = transform_cameras(T1, camtoworlds)
             points = transform_points(T1, points)
 
-            T2 = align_principal_axes(points)
-            camtoworlds = transform_cameras(T2, camtoworlds)
-            points = transform_points(T2, points)
+            # Bbox samples replace SFM points and must not influence the PCA
+            # orientation. Nerfstudio also determines its camera transform
+            # before loading bbox seed points.
+            if not load_bbox and points.shape[0] >= 3:
+                T2 = align_principal_axes(points)
+                camtoworlds = transform_cameras(T2, camtoworlds)
+                points = transform_points(T2, points)
+                transform = T2 @ T1
 
-            transform = T2 @ T1
-
-            # Fix for up side down. We assume more points towards
-            # the bottom of the scene which is true when ground floor is
-            # present in the images.
-            if np.median(points[:, 2]) > np.mean(points[:, 2]):
-                # rotate 180 degrees around x axis such that z is flipped
-                T3 = np.array(
-                    [
-                        [1.0, 0.0, 0.0, 0.0],
-                        [0.0, -1.0, 0.0, 0.0],
-                        [0.0, 0.0, -1.0, 0.0],
-                        [0.0, 0.0, 0.0, 1.0],
-                    ]
-                )
-                camtoworlds = transform_cameras(T3, camtoworlds)
-                points = transform_points(T3, points)
-                transform = T3 @ transform
+                if np.median(points[:, 2]) > np.mean(points[:, 2]):
+                    T3 = np.array(
+                        [
+                            [1.0, 0.0, 0.0, 0.0],
+                            [0.0, -1.0, 0.0, 0.0],
+                            [0.0, 0.0, -1.0, 0.0],
+                            [0.0, 0.0, 0.0, 1.0],
+                        ]
+                    )
+                    camtoworlds = transform_cameras(T3, camtoworlds)
+                    points = transform_points(T3, points)
+                    transform = T3 @ transform
+            else:
+                # Keep camera-based centering/scaling, but skip point-cloud PCA.
+                transform = T1
         else:
             transform = np.eye(4)
 
@@ -364,9 +415,15 @@ class Dataset:
         self.load_depths = load_depths
         indices = np.arange(len(self.parser.image_names))
         if split == "train":
-            self.indices = indices[indices % self.parser.test_every != 0]
+            if self.parser.test_every != -1:
+                self.indices = indices[indices % self.parser.test_every != 0]
+            else:
+                self.indices = indices
         else:
-            self.indices = indices[indices % self.parser.test_every == 0]
+            if self.parser.test_every != -1:
+                self.indices = indices[indices % self.parser.test_every == 0]
+            else:
+                self.indices = indices
 
     def __len__(self):
         return len(self.indices)

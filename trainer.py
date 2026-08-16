@@ -83,10 +83,16 @@ class Config:
 
     # Initialization strategy
     init_type: str = "sfm"
+    # Replace COLMAP points with points sampled uniformly from sparse/0/bbox.txt.
+    # This mirrors Nerfstudio's colmap --load-bbox option and is used with
+    # init_type="sfm" because the sampled points act as seed points.
+    load_bbox: bool = False
+    # Number of seed points to sample when load_bbox is enabled.
+    num_points_from_bbox: int = 50_000
     # Initial number of GSs. Ignored if using sfm
     init_num_pts: int = 100_000
     # Initial extent of GSs as a multiple of the camera extent. Ignored if using sfm
-    init_extent: float = 3.0
+    init_extent: float = 0.5
     # Degree of spherical harmonics
     sh_degree: int = 3
     # Turn on another SH degree every this steps
@@ -219,7 +225,9 @@ def create_splats_with_optimizers(
         points = torch.from_numpy(parser.points).float()
         rgbs = torch.from_numpy(parser.points_rgb / 255.0).float()
     elif init_type == "random":
-        points = init_extent * scene_scale * (torch.rand((init_num_pts, 3)) * 2 - 1)
+        points = init_extent * scene_scale * (
+            torch.rand((init_num_pts, 3)) * 2 - 1
+        )
         rgbs = torch.rand((init_num_pts, 3))
     else:
         raise ValueError("Please specify a correct init_type: sfm or random")
@@ -293,6 +301,15 @@ class Runner:
         set_random_seed(42 + local_rank)
 
         self.cfg = cfg
+        if cfg.load_bbox and cfg.init_type != "sfm":
+            raise ValueError(
+                "load_bbox provides SFM-style seed points; use init_type='sfm'."
+            )
+        if cfg.load_bbox and cfg.depth_loss:
+            raise ValueError(
+                "BBox seed points have no COLMAP 2D tracks and cannot provide "
+                "sparse depth supervision."
+            )
         self.world_rank = world_rank
         self.local_rank = local_rank
         self.world_size = world_size
@@ -312,7 +329,8 @@ class Runner:
         os.makedirs(self.ply_dir, exist_ok=True)
 
         # Tensorboard
-        self.writer = SummaryWriter(log_dir=f"{cfg.result_dir}/tb")
+        if cfg.tb_every != 0:
+            self.writer = SummaryWriter(log_dir=f"{cfg.result_dir}/tb")
 
         # Load data: Training data should contain initial points and colors.
         self.parser = Parser(
@@ -320,6 +338,8 @@ class Runner:
             factor=cfg.data_factor,
             normalize=cfg.normalize_world_space,
             test_every=cfg.test_every,
+            load_bbox=cfg.load_bbox,
+            num_points_from_bbox=cfg.num_points_from_bbox,
         )
         self.trainset = Dataset(
             self.parser,
@@ -624,6 +644,8 @@ class Runner:
             if cfg.random_bkgd:
                 bkgd = torch.rand(1, 3, device=device)
                 colors = colors + bkgd * (1.0 - alphas)
+            else:
+                colors = colors + 0.0 * (1.0 - alphas)
 
             self.cfg.strategy.step_pre_backward(
                 params=self.splats,
@@ -930,9 +952,10 @@ class Runner:
             with open(f"{self.stats_dir}/{stage}_step{step:04d}.json", "w") as f:
                 json.dump(stats, f)
             # save stats to tensorboard
-            for k, v in stats.items():
-                self.writer.add_scalar(f"{stage}/{k}", v, step)
-            self.writer.flush()
+            if cfg.tb_every != 0:
+                for k, v in stats.items():
+                    self.writer.add_scalar(f"{stage}/{k}", v, step)
+                self.writer.flush()
 
 
     @torch.no_grad()
