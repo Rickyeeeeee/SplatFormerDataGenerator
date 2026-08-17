@@ -315,7 +315,6 @@ def main():
                     print(f'[SKIP] {obj_id} due to invalid Gaussians')
                     invalid_gaussians = True
                     break
-        exit()
 
         if invalid_gaussians:
             continue
