@@ -25,7 +25,7 @@ python setup.py install
 wget https://download.blender.org/release/Blender2.90/blender-2.90.0-linux64.tar.xz # For ShapeNet
 tar -xvf blender-2.90.0-linux64.tar.xz
 wget https://download.blender.org/release/Blender3.2/blender-3.2.2-linux-x64.tar.xz # For Objaverse-v1 and GSO
-tar -xvf blender-3.2.2-linux-x64
+tar -xvf blender-3.2.2-linux-x64.tar.xz
 ```
 ### nerfstudio (for 3DGS training)
 ```
