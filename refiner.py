@@ -50,6 +50,10 @@ class Config:
     old_data_dir: str = "data/360_v2/garden"
     # Target-resolution dataset used for refinement and evaluation.
     new_data_dir: str = "data/360_v2/garden"
+    # Linearly increase training image resolution from old_data_dir to new_data_dir.
+    interp: bool = False
+    # Iteration at which interpolation reaches the new-data image resolution.
+    interp_end_iter: int = 7_000
     # Downsample factor for the dataset
     data_factor: int = 4
     # Directory to save results
@@ -191,6 +195,7 @@ class Config:
         self.ply_steps = [int(i * factor) for i in self.ply_steps]
         self.max_steps = int(self.max_steps * factor)
         self.sh_degree_interval = int(self.sh_degree_interval * factor)
+        self.interp_end_iter = int(self.interp_end_iter * factor)
 
         strategy = self.strategy
         if isinstance(strategy, DefaultStrategy):
@@ -492,6 +497,26 @@ class Runner:
             load_depths=cfg.depth_loss,
             alpha_aware=cfg.alpha_aware,
         )
+        self.interp_train_scales: List[Tuple[float, float]] = []
+        if cfg.interp:
+            old_sizes = {
+                name: old_parser.imsize_dict[camera_id]
+                for name, camera_id in zip(
+                    old_parser.image_names, old_parser.camera_ids
+                )
+            }
+            for index in self.trainset.indices:
+                name = self.parser.image_names[index]
+                if name not in old_sizes:
+                    raise ValueError(
+                        f"Interpolation image {name!r} is missing from old_data_dir."
+                    )
+                old_width, old_height = old_sizes[name]
+                camera_id = self.parser.camera_ids[index]
+                new_width, new_height = self.parser.imsize_dict[camera_id]
+                self.interp_train_scales.append(
+                    (old_height / new_height, old_width / new_width)
+                )
         self.valset = Dataset(
             self.parser, split="val", alpha_aware=cfg.alpha_aware
         )
@@ -705,6 +730,96 @@ class Runner:
             render_colors[~masks] = 0
         return render_colors, render_alphas, info
 
+    def _export_ply(self, step: int, sh_degree: int):
+        if self.cfg.app_opt:
+            # Evaluate at the origin to bake the appearance into the colors.
+            rgb = self.app_module(
+                features=self.splats["features"],
+                embed_ids=None,
+                dirs=torch.zeros_like(self.splats["means"][None, :, :]),
+                sh_degree=sh_degree,
+            )
+            rgb = rgb + self.splats["colors"]
+            rgb = torch.sigmoid(rgb).squeeze(0).unsqueeze(1)
+            sh0 = rgb_to_sh(rgb)
+            shN = torch.empty([sh0.shape[0], 0, 3], device=sh0.device)
+        else:
+            sh0 = self.splats["sh0"]
+            shN = self.splats["shN"]
+
+        export_splats(
+            means=self.splats["means"],
+            scales=self.splats["scales"],
+            quats=self.splats["quats"],
+            opacities=self.splats["opacities"],
+            sh0=sh0,
+            shN=shN,
+            format="ply",
+            save_to=f"{self.ply_dir}/point_cloud_{step}.ply",
+        )
+
+    def _interpolate_training_batch(
+        self,
+        step: int,
+        image_ids: Tensor,
+        pixels: Tensor,
+        Ks: Tensor,
+        alpha: Optional[Tensor],
+        masks: Optional[Tensor],
+    ) -> Tuple[Tensor, Tensor, Optional[Tensor], Optional[Tensor], float, float]:
+        if not self.cfg.interp or step >= self.cfg.interp_end_iter:
+            return pixels, Ks, alpha, masks, 1.0, 1.0
+
+        progress = step / self.cfg.interp_end_iter
+        batch_scales = [
+            self.interp_train_scales[image_id]
+            for image_id in image_ids.detach().cpu().tolist()
+        ]
+        scale_y = (1.0 - progress) * batch_scales[0][0] + progress
+        scale_x = (1.0 - progress) * batch_scales[0][1] + progress
+        for old_scale_y, old_scale_x in batch_scales[1:]:
+            item_scale_y = (1.0 - progress) * old_scale_y + progress
+            item_scale_x = (1.0 - progress) * old_scale_x + progress
+            if not (
+                math.isclose(item_scale_y, scale_y)
+                and math.isclose(item_scale_x, scale_x)
+            ):
+                raise ValueError(
+                    "Images in an interpolated batch must use the same old-to-new "
+                    "resolution ratio."
+                )
+
+        source_height, source_width = pixels.shape[1:3]
+        target_height = max(1, round(source_height * scale_y))
+        target_width = max(1, round(source_width * scale_x))
+        scale_y = target_height / source_height
+        scale_x = target_width / source_width
+
+        pixels = F.interpolate(
+            pixels.permute(0, 3, 1, 2),
+            size=(target_height, target_width),
+            mode="bilinear",
+            align_corners=False,
+        ).permute(0, 2, 3, 1)
+        if alpha is not None:
+            alpha = F.interpolate(
+                alpha.permute(0, 3, 1, 2),
+                size=(target_height, target_width),
+                mode="bilinear",
+                align_corners=False,
+            ).permute(0, 2, 3, 1)
+        if masks is not None:
+            masks = F.interpolate(
+                masks.unsqueeze(1).float(),
+                size=(target_height, target_width),
+                mode="nearest",
+            ).squeeze(1).bool()
+
+        Ks = Ks.clone()
+        Ks[:, 0, :] *= scale_x
+        Ks[:, 1, :] *= scale_y
+        return pixels, Ks, alpha, masks, scale_x, scale_y
+
     def train(self):
         cfg = self.cfg
         device = self.device
@@ -756,6 +871,16 @@ class Runner:
         # Training loop.
         global_tic = time.time()
         pbar = tqdm.tqdm(range(init_step, max_steps))
+
+        # Positive eval steps are checked after the corresponding optimizer
+        # update below. Step 0 is the initial model, so evaluate it before the
+        # first training iteration instead.
+        if 0 in cfg.eval_steps:
+            self.eval(0)
+
+        if cfg.save_ply and 0 in cfg.ply_steps:
+            self._export_ply(0, sh_degree=0)
+
         for step in pbar:
             if not cfg.disable_viewer:
                 while self.viewer.state == "paused":
@@ -775,15 +900,23 @@ class Runner:
             gt_alpha = (
                 data["alpha"].to(device) / 255.0 if cfg.alpha_aware else None
             )
-            num_train_rays_per_step = (
-                pixels.shape[0] * pixels.shape[1] * pixels.shape[2]
-            )
             image_ids = data["image_id"].to(device)
             masks = data["mask"].to(device) if "mask" in data else None  # [1, H, W]
             if cfg.depth_loss:
                 points = data["points"].to(device)  # [1, M, 2]
                 depths_gt = data["depths"].to(device)  # [1, M]
 
+            pixels, Ks, gt_alpha, masks, interp_scale_x, interp_scale_y = (
+                self._interpolate_training_batch(
+                    step, image_ids, pixels, Ks, gt_alpha, masks
+                )
+            )
+            if cfg.depth_loss and (interp_scale_x != 1.0 or interp_scale_y != 1.0):
+                points = points * points.new_tensor([interp_scale_x, interp_scale_y])
+
+            num_train_rays_per_step = (
+                pixels.shape[0] * pixels.shape[1] * pixels.shape[2]
+            )
             height, width = pixels.shape[1:3]
 
 
@@ -876,7 +1009,11 @@ class Runner:
 
             loss.backward()
 
-            desc = f"loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "
+            desc = (
+                f"loss={loss.item():.3f}| "
+                f"resolution={width}x{height}| "
+                f"sh degree={sh_degree_to_use}| "
+            )
             if cfg.depth_loss:
                 desc += f"depth loss={depthloss.item():.6f}| "
             pbar.set_description(desc)
@@ -933,37 +1070,7 @@ class Runner:
             if (
                 step in [i - 1 for i in cfg.ply_steps] or step == max_steps - 1
             ) and cfg.save_ply:
-
-                if self.cfg.app_opt:
-                    # eval at origin to bake the appeareance into the colors
-                    rgb = self.app_module(
-                        features=self.splats["features"],
-                        embed_ids=None,
-                        dirs=torch.zeros_like(self.splats["means"][None, :, :]),
-                        sh_degree=sh_degree_to_use,
-                    )
-                    rgb = rgb + self.splats["colors"]
-                    rgb = torch.sigmoid(rgb).squeeze(0).unsqueeze(1)
-                    sh0 = rgb_to_sh(rgb)
-                    shN = torch.empty([sh0.shape[0], 0, 3], device=sh0.device)
-                else:
-                    sh0 = self.splats["sh0"]
-                    shN = self.splats["shN"]
-
-                means = self.splats["means"]
-                scales = self.splats["scales"]
-                quats = self.splats["quats"]
-                opacities = self.splats["opacities"]
-                export_splats(
-                    means=means,
-                    scales=scales,
-                    quats=quats,
-                    opacities=opacities,
-                    sh0=sh0,
-                    shN=shN,
-                    format="ply",
-                    save_to=f"{self.ply_dir}/point_cloud_{step}.ply",
-                )
+                self._export_ply(step, sh_degree=sh_degree_to_use)
 
             # Turn Gradients into Sparse Tensor before running optimizer
             if cfg.sparse_grad:
@@ -1240,6 +1347,8 @@ class Runner:
 
 
 def main(local_rank: int, world_rank, world_size: int, cfg: Config):
+    if cfg.interp and cfg.interp_end_iter <= 0:
+        raise ValueError("--interp-end-iter must be greater than zero with --interp.")
     if cfg.init_ckpt is not None and cfg.ckpt is not None:
         raise ValueError("Use either --init-ckpt or --ckpt, not both.")
     if cfg.init_ckpt is None and cfg.ckpt is None:

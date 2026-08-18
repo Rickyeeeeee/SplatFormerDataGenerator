@@ -1,0 +1,22 @@
+steps=3000
+CUDA_VISIBLE_DEVICES=0 python refiner.py default \
+    --disable_viewer \
+    --init-ckpt='/project/ricky/splatformer-sr-data/train-set/objaverse/128/gsplat/0a1fb4eac5fe4ac396e0053693cdd104/ckpts/ckpt_14999_rank0.pt' \
+    --old-data-dir='/project/ricky/splatformer-sr-data/train-set/objaverse/128/colmap/0a1fb4eac5fe4ac396e0053693cdd104' \
+    --new-data-dir='/project/ricky/splatformer-sr-data/train-set/objaverse/512/colmap/0a1fb4eac5fe4ac396e0053693cdd104' \
+    --result-dir='/project/ricky/splatformer-sr-data/train-set-4x-up/objaverse/128/gsplat/0a1fb4eac5fe4ac396e0053693cdd104' \
+    --data-factor=1 \
+    --test-every=-1 \
+    --max-steps="$steps" \
+    --eval-steps=0 1000 2000 "$steps" \
+    --save-steps="$steps" \
+    --alpha-aware \
+    --disable-video \
+    --init-type=sfm \
+    --load-bbox \
+    --num-points-from-bbox=50000 \
+    --no-normalize-world-space \
+    --batch-size 4 \
+    --sh-degree=1 \
+    --tb-every=0 \
+    --strategy.refine-start-iter=1000000
