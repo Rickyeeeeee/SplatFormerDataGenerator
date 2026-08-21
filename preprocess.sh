@@ -1,1 +1,1 @@
-python preprocess.py --scan --filter --refine --statistics --gpu_id 0
+python preprocess.py --scan --filter --refine --testset --statistics --gpu_id 1

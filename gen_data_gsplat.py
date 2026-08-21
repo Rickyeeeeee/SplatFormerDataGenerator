@@ -46,6 +46,11 @@ def parse_args():
         metavar='RESOLUTION',
         help='Native image resolutions to render (default: 512 256 128).',
     )
+    parser.add_argument(
+        "--skip_gs",
+        type=bool,
+        default=False,
+    )
     args = parser.parse_args()
 
     if not re.fullmatch(r'000-\d{3}', args.partition):
@@ -112,7 +117,7 @@ def select_gpu(requested_gpu_id):
 
 
 def split_root(split_name, resolution):
-    return DATASET_ROOT / f'{split_name}-set' / 'objaverse' / str(resolution)
+    return DATASET_ROOT / f'{split_name}-set-exp' / 'objaverse' / str(resolution)
 
 
 def build_render_command(obj_path, obj_output_dir, resolution):
@@ -273,6 +278,8 @@ def main():
                 print(' '.join(render_cmd))
                 subprocess.run(render_cmd, env=env, check=True)
 
+            if args.skip_gs:
+                continue
             checkpoint_path = (
                 output_dir
                 / 'ckpts'

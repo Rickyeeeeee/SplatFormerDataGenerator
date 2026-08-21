@@ -37,7 +37,7 @@ def parse_args() -> argparse.Namespace:
         "--dataset_root",
         type=Path,
         default=DEFAULT_DATASET_ROOT,
-        help=f"Dataset root containing train-set (default: {DEFAULT_DATASET_ROOT}).",
+        help=f"Dataset root containing train-set or test-set (default: {DEFAULT_DATASET_ROOT}).",
     )
     parser.add_argument(
         "--old_resolution",
@@ -88,6 +88,14 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Regenerate gs_statistics.json from available refined checkpoints.",
     )
+    parser.add_argument(
+        "--testset",
+        action="store_true",
+        help=(
+            "Use test-set as input and test-set-4x-up as refinement output "
+            "instead of the train-set directories."
+        ),
+    )
     args = parser.parse_args()
 
     if args.old_resolution <= 0 or args.new_resolution <= 0:
@@ -101,23 +109,30 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-def input_objaverse_root(dataset_root: Path) -> Path:
-    return dataset_root / "train-set" / "objaverse"
+def input_objaverse_root(dataset_root: Path, testset: bool = False) -> Path:
+    source_directory = "test-set-exp" if testset else "train-set"
+    return dataset_root / source_directory / "objaverse"
 
 
-def refined_objaverse_root(dataset_root: Path) -> Path:
-    return dataset_root / "train-set-4x-up" / "objaverse"
+def refined_objaverse_root(dataset_root: Path, testset: bool = False) -> Path:
+    output_directory = "test-set-4x-up" if testset else "train-set-4x-up"
+    return dataset_root / output_directory / "objaverse"
 
 
-def resolution_root(dataset_root: Path, resolution: int) -> Path:
-    return input_objaverse_root(dataset_root) / str(resolution)
+def resolution_root(
+    dataset_root: Path, resolution: int, testset: bool = False
+) -> Path:
+    return input_objaverse_root(dataset_root, testset) / str(resolution)
 
 
 def source_checkpoint_path(
-    dataset_root: Path, resolution: int, scene_id: str
+    dataset_root: Path,
+    resolution: int,
+    scene_id: str,
+    testset: bool = False,
 ) -> Path:
     return (
-        resolution_root(dataset_root, resolution)
+        resolution_root(dataset_root, resolution, testset)
         / "gsplat"
         / scene_id
         / "ckpts"
@@ -125,9 +140,14 @@ def source_checkpoint_path(
     )
 
 
-def source_stats_path(dataset_root: Path, resolution: int, scene_id: str) -> Path:
+def source_stats_path(
+    dataset_root: Path,
+    resolution: int,
+    scene_id: str,
+    testset: bool = False,
+) -> Path:
     return (
-        resolution_root(dataset_root, resolution)
+        resolution_root(dataset_root, resolution, testset)
         / "gsplat"
         / scene_id
         / "stats"
@@ -135,9 +155,14 @@ def source_stats_path(dataset_root: Path, resolution: int, scene_id: str) -> Pat
     )
 
 
-def refined_scene_dir(dataset_root: Path, old_resolution: int, scene_id: str) -> Path:
+def refined_scene_dir(
+    dataset_root: Path,
+    old_resolution: int,
+    scene_id: str,
+    testset: bool = False,
+) -> Path:
     return (
-        refined_objaverse_root(dataset_root)
+        refined_objaverse_root(dataset_root, testset)
         / str(old_resolution)
         / "gsplat"
         / scene_id
@@ -145,9 +170,16 @@ def refined_scene_dir(dataset_root: Path, old_resolution: int, scene_id: str) ->
 
 
 def refined_checkpoint_path(
-    dataset_root: Path, old_resolution: int, scene_id: str
+    dataset_root: Path,
+    old_resolution: int,
+    scene_id: str,
+    testset: bool = False,
 ) -> Path:
-    return refined_scene_dir(dataset_root, old_resolution, scene_id) / "ckpts" / REFINED_CHECKPOINT_NAME
+    return (
+        refined_scene_dir(dataset_root, old_resolution, scene_id, testset)
+        / "ckpts"
+        / REFINED_CHECKPOINT_NAME
+    )
 
 
 def csv_fieldnames(resolutions: Sequence[int]) -> List[str]:
@@ -173,10 +205,14 @@ def _child_directory_names(path: Path) -> set:
     return {entry.name for entry in path.iterdir() if entry.is_dir()}
 
 
-def discover_scene_ids(dataset_root: Path, resolutions: Iterable[int]) -> List[str]:
+def discover_scene_ids(
+    dataset_root: Path,
+    resolutions: Iterable[int],
+    testset: bool = False,
+) -> List[str]:
     scene_ids = set()
     for resolution in resolutions:
-        root = resolution_root(dataset_root, resolution)
+        root = resolution_root(dataset_root, resolution, testset)
         scene_ids.update(_child_directory_names(root / "colmap"))
         scene_ids.update(_child_directory_names(root / "gsplat"))
     return sorted(scene_ids)
@@ -223,20 +259,32 @@ def load_render_metrics(path: Path) -> Dict[str, Any]:
 
 
 def inspect_scene_resolution(
-    dataset_root: Path, resolution: int, scene_id: str
+    dataset_root: Path,
+    resolution: int,
+    scene_id: str,
+    testset: bool = False,
 ) -> Dict[str, Any]:
-    images_dir = resolution_root(dataset_root, resolution) / "colmap" / scene_id / "images"
+    images_dir = (
+        resolution_root(dataset_root, resolution, testset)
+        / "colmap"
+        / scene_id
+        / "images"
+    )
     image_count = count_png_images(images_dir)
     if image_count != EXPECTED_IMAGE_COUNT:
         raise ValueError(
             f"Expected {EXPECTED_IMAGE_COUNT} PNG images at {images_dir}, found {image_count}."
         )
 
-    checkpoint_path = source_checkpoint_path(dataset_root, resolution, scene_id)
+    checkpoint_path = source_checkpoint_path(
+        dataset_root, resolution, scene_id, testset
+    )
     if not checkpoint_path.is_file():
         raise FileNotFoundError(f"Missing checkpoint: {checkpoint_path}")
 
-    metrics = load_render_metrics(source_stats_path(dataset_root, resolution, scene_id))
+    metrics = load_render_metrics(
+        source_stats_path(dataset_root, resolution, scene_id, testset)
+    )
     return {
         "image_count": image_count,
         "num_gs": metrics["num_GS"],
@@ -248,16 +296,20 @@ def inspect_scene_resolution(
 
 
 def scan_valid_scenes(
-    dataset_root: Path, resolutions: Sequence[int]
+    dataset_root: Path,
+    resolutions: Sequence[int],
+    testset: bool = False,
 ) -> Tuple[List[Dict[str, Any]], Counter]:
     rows: List[Dict[str, Any]] = []
     invalid_reasons: Counter = Counter()
 
-    for scene_id in discover_scene_ids(dataset_root, resolutions):
+    for scene_id in discover_scene_ids(dataset_root, resolutions, testset):
         row: Dict[str, Any] = {"scene_id": scene_id}
         try:
             for resolution in resolutions:
-                values = inspect_scene_resolution(dataset_root, resolution, scene_id)
+                values = inspect_scene_resolution(
+                    dataset_root, resolution, scene_id, testset
+                )
                 prefix = f"res_{resolution}"
                 for name, value in values.items():
                     row[f"{prefix}_{name}"] = value
@@ -357,11 +409,24 @@ def build_refiner_command(
     new_resolution: int,
     scene_id: str,
     refiner_path: Path,
+    testset: bool = False,
 ) -> List[str]:
-    init_checkpoint = source_checkpoint_path(dataset_root, old_resolution, scene_id)
-    old_data_dir = resolution_root(dataset_root, old_resolution) / "colmap" / scene_id
-    new_data_dir = resolution_root(dataset_root, new_resolution) / "colmap" / scene_id
-    result_dir = refined_scene_dir(dataset_root, old_resolution, scene_id)
+    init_checkpoint = source_checkpoint_path(
+        dataset_root, old_resolution, scene_id, testset
+    )
+    old_data_dir = (
+        resolution_root(dataset_root, old_resolution, testset)
+        / "colmap"
+        / scene_id
+    )
+    new_data_dir = (
+        resolution_root(dataset_root, new_resolution, testset)
+        / "colmap"
+        / scene_id
+    )
+    result_dir = refined_scene_dir(
+        dataset_root, old_resolution, scene_id, testset
+    )
     return [
         sys.executable,
         str(refiner_path),
@@ -398,6 +463,7 @@ def run_refinements(
     gpu_id: Optional[int],
     force: bool,
     refiner_path: Path,
+    testset: bool = False,
 ) -> Tuple[Dict[str, str], List[Dict[str, Any]]]:
     statuses: Dict[str, str] = {}
     failures: List[Dict[str, Any]] = []
@@ -405,7 +471,9 @@ def run_refinements(
 
     for row in rows:
         scene_id = str(row["scene_id"])
-        final_checkpoint = refined_checkpoint_path(dataset_root, old_resolution, scene_id)
+        final_checkpoint = refined_checkpoint_path(
+            dataset_root, old_resolution, scene_id, testset
+        )
         if final_checkpoint.is_file() and not force:
             statuses[scene_id] = "reused"
         else:
@@ -430,14 +498,19 @@ def run_refinements(
 
     for scene_id in pending:
         command = build_refiner_command(
-            dataset_root, old_resolution, new_resolution, scene_id, refiner_path
+            dataset_root,
+            old_resolution,
+            new_resolution,
+            scene_id,
+            refiner_path,
+            testset,
         )
         print(f"\n[REFINE] {scene_id} on GPU {selected_gpu}")
         print(" ".join(command))
         try:
             subprocess.run(command, env=env, check=True)
             final_checkpoint = refined_checkpoint_path(
-                dataset_root, old_resolution, scene_id
+                dataset_root, old_resolution, scene_id, testset
             )
             if not final_checkpoint.is_file():
                 raise FileNotFoundError(
@@ -622,6 +695,7 @@ def calculate_statistics(
     statuses: Dict[str, str],
     dataset_root: Path,
     old_resolution: int,
+    testset: bool = False,
 ) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any], List[Dict[str, Any]]]:
     scenes: Dict[str, Dict[str, Any]] = {}
     failures: List[Dict[str, Any]] = []
@@ -633,10 +707,10 @@ def calculate_statistics(
         if status not in {"refined", "reused"}:
             continue
         input_checkpoint = source_checkpoint_path(
-            dataset_root, old_resolution, scene_id
+            dataset_root, old_resolution, scene_id, testset
         )
         output_checkpoint = refined_checkpoint_path(
-            dataset_root, old_resolution, scene_id
+            dataset_root, old_resolution, scene_id, testset
         )
         try:
             scene_stats, shapes = compute_scene_statistics(
@@ -668,12 +742,17 @@ def calculate_statistics(
 
 
 def existing_refinement_statuses(
-    rows: Sequence[Dict[str, Any]], dataset_root: Path, old_resolution: int
+    rows: Sequence[Dict[str, Any]],
+    dataset_root: Path,
+    old_resolution: int,
+    testset: bool = False,
 ) -> Dict[str, str]:
     statuses: Dict[str, str] = {}
     for row in rows:
         scene_id = str(row["scene_id"])
-        if refined_checkpoint_path(dataset_root, old_resolution, scene_id).is_file():
+        if refined_checkpoint_path(
+            dataset_root, old_resolution, scene_id, testset
+        ).is_file():
             statuses[scene_id] = "reused"
         else:
             statuses[scene_id] = "not_run"
@@ -691,14 +770,15 @@ def main() -> int:
     args = parse_args()
     dataset_root = args.dataset_root.resolve()
     resolutions = (args.old_resolution, args.new_resolution)
-    train_root = input_objaverse_root(dataset_root)
+    train_root = input_objaverse_root(dataset_root, args.testset)
     if not train_root.is_dir():
         print(f"[ERROR] Input dataset directory does not exist: {train_root}")
         return 1
 
-    valid_csv = dataset_root / "valid_scenes.csv"
-    filtered_csv = dataset_root / "psnr_filtered_scenes.csv"
-    statistics_json = dataset_root / "gs_statistics.json"
+    metadata_prefix = "test_" if args.testset else ""
+    valid_csv = dataset_root / f"{metadata_prefix}valid_scenes.csv"
+    filtered_csv = dataset_root / f"{metadata_prefix}psnr_filtered_scenes.csv"
+    statistics_json = dataset_root / f"{metadata_prefix}gs_statistics.json"
     stage_flags_specified = any(
         (args.scan, args.filter, args.refine, args.statistics)
     )
@@ -714,7 +794,9 @@ def main() -> int:
     filtered_regenerated = False
     if args.scan or not valid_csv.is_file():
         print(f"Scanning paired scenes under {train_root}")
-        valid_rows, invalid_reasons = scan_valid_scenes(dataset_root, resolutions)
+        valid_rows, invalid_reasons = scan_valid_scenes(
+            dataset_root, resolutions, args.testset
+        )
         write_scene_csv(valid_rows, valid_csv, resolutions)
         print(f"Wrote {valid_csv}")
     else:
@@ -765,10 +847,11 @@ def main() -> int:
             args.gpu_id,
             args.force,
             refiner_path,
+            args.testset,
         )
     else:
         statuses = existing_refinement_statuses(
-            filtered_rows, dataset_root, args.old_resolution
+            filtered_rows, dataset_root, args.old_resolution, args.testset
         )
 
     run_statistics = args.statistics or (
@@ -786,7 +869,11 @@ def main() -> int:
         return 1 if failures else 0
 
     scenes, aggregate, statistics_failures = calculate_statistics(
-        filtered_rows, statuses, dataset_root, args.old_resolution
+        filtered_rows,
+        statuses,
+        dataset_root,
+        args.old_resolution,
+        args.testset,
     )
     failures.extend(statistics_failures)
 
@@ -796,7 +883,8 @@ def main() -> int:
         "config": {
             "dataset_root": str(dataset_root),
             "input_root": str(train_root),
-            "refined_root": str(refined_objaverse_root(dataset_root)),
+            "refined_root": str(refined_objaverse_root(dataset_root, args.testset)),
+            "dataset_split": "test" if args.testset else "train",
             "old_resolution": args.old_resolution,
             "new_resolution": args.new_resolution,
             "expected_image_count": EXPECTED_IMAGE_COUNT,
