@@ -4,3 +4,6 @@
 [submodule "pycolmap"]
 	path = pycolmap
 	url = https://github.com/Rickyeeeeee/pycolmap.git
+[submodule "gsplat"]
+	path = gsplat
+	url = https://github.com/nerfstudio-project/gsplat.git
