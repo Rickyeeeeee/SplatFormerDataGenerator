@@ -431,6 +431,7 @@ def build_refiner_command(
         sys.executable,
         str(refiner_path),
         "default",
+        "--cache-images-on-gpu",
         "--disable_viewer",
         f"--init-ckpt={init_checkpoint}",
         f"--old-data-dir={old_data_dir}",
