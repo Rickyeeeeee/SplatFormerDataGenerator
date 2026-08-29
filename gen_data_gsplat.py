@@ -143,6 +143,7 @@ def build_train_command(colmap_dir, output_dir, obj_id):
         'python',
         'trainer.py',
         'default',
+        '--cache-images-on-gpu',
         '--disable_viewer',
         f'--data-dir={colmap_dir}',
         '--data-factor=1',

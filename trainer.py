@@ -65,6 +65,8 @@ class Config:
 
     # Batch size for training. Learning rates are scaled automatically
     batch_size: int = 1
+    # Cache decoded training images and camera data on the GPU.
+    cache_images_on_gpu: bool = False
     # A global factor to scale the number of training steps
     steps_scaler: float = 1.0
 
@@ -572,15 +574,88 @@ class Runner:
                 )
             )
 
-        trainloader = torch.utils.data.DataLoader(
-            self.trainset,
-            batch_size=cfg.batch_size,
-            shuffle=True,
-            num_workers=4,
-            persistent_workers=True,
-            pin_memory=True,
-        )
-        trainloader_iter = iter(trainloader)
+        cached_train_data = None
+        cached_order = None
+        cached_offset = 0
+        if cfg.cache_images_on_gpu:
+            if len(self.trainset) == 0:
+                raise ValueError("Cannot cache an empty training dataset.")
+
+            cached_lists = {
+                "image": [],
+                "camtoworld": [],
+                "K": [],
+            }
+            if cfg.alpha_aware:
+                cached_lists["alpha"] = []
+
+            image_shape = None
+            cache_has_masks = None
+            for i in range(len(self.trainset)):
+                sample = self.trainset[i]
+                if image_shape is None:
+                    image_shape = sample["image"].shape
+                elif sample["image"].shape != image_shape:
+                    raise ValueError(
+                        "--cache-images-on-gpu requires all training images to "
+                        "have the same shape."
+                    )
+
+                sample_has_mask = "mask" in sample
+                if cache_has_masks is None:
+                    cache_has_masks = sample_has_mask
+                    if cache_has_masks:
+                        cached_lists["mask"] = []
+                elif sample_has_mask != cache_has_masks:
+                    raise ValueError(
+                        "--cache-images-on-gpu requires either every training "
+                        "image or no training image to have a mask."
+                    )
+
+                cached_lists["image"].append(sample["image"].to(torch.uint8))
+                cached_lists["camtoworld"].append(sample["camtoworld"])
+                cached_lists["K"].append(sample["K"])
+                if cfg.alpha_aware:
+                    cached_lists["alpha"].append(sample["alpha"].to(torch.uint8))
+                if cache_has_masks:
+                    cached_lists["mask"].append(sample["mask"])
+
+            cached_train_data_cpu = {
+                key: torch.stack(values) for key, values in cached_lists.items()
+            }
+            del cached_lists
+
+            cache_bytes = sum(
+                tensor.numel() * tensor.element_size()
+                for tensor in cached_train_data_cpu.values()
+            )
+            if world_rank == 0:
+                print(
+                    f"Caching {len(self.trainset)} training images on GPU "
+                    f"({cache_bytes / 1024**3:.2f} GiB)."
+                )
+            try:
+                cached_train_data = {
+                    key: value.to(device)
+                    for key, value in cached_train_data_cpu.items()
+                }
+            except torch.OutOfMemoryError as error:
+                torch.cuda.empty_cache()
+                raise RuntimeError(
+                    "Not enough GPU memory for --cache-images-on-gpu; disable "
+                    "the option or use smaller training images."
+                ) from error
+            del cached_train_data_cpu
+        else:
+            trainloader = torch.utils.data.DataLoader(
+                self.trainset,
+                batch_size=cfg.batch_size,
+                shuffle=True,
+                num_workers=4,
+                persistent_workers=True,
+                pin_memory=True,
+            )
+            trainloader_iter = iter(trainloader)
 
         # Training loop.
         global_tic = time.time()
@@ -592,11 +667,25 @@ class Runner:
                 self.viewer.lock.acquire()
                 tic = time.time()
 
-            try:
-                data = next(trainloader_iter)
-            except StopIteration:
-                trainloader_iter = iter(trainloader)
-                data = next(trainloader_iter)
+            if cached_train_data is not None:
+                if cached_order is None or cached_offset >= len(self.trainset):
+                    cached_order = torch.randperm(len(self.trainset), device=device)
+                    cached_offset = 0
+                image_ids = cached_order[
+                    cached_offset : cached_offset + cfg.batch_size
+                ]
+                cached_offset += len(image_ids)
+                data = {
+                    key: value[image_ids]
+                    for key, value in cached_train_data.items()
+                }
+                data["image_id"] = image_ids
+            else:
+                try:
+                    data = next(trainloader_iter)
+                except StopIteration:
+                    trainloader_iter = iter(trainloader)
+                    data = next(trainloader_iter)
 
             camtoworlds = camtoworlds_gt = data["camtoworld"].to(device)  # [1, 4, 4]
             Ks = data["K"].to(device)  # [1, 3, 3]
@@ -1069,6 +1158,16 @@ class Runner:
 
 
 def main(local_rank: int, world_rank, world_size: int, cfg: Config):
+    if cfg.cache_images_on_gpu and cfg.depth_loss:
+        raise ValueError(
+            "--cache-images-on-gpu does not support --depth-loss because sparse "
+            "depth samples have variable lengths."
+        )
+    if cfg.cache_images_on_gpu and cfg.patch_size is not None:
+        raise ValueError(
+            "--cache-images-on-gpu does not support --patch-size because cached "
+            "images would reuse the same random crop."
+        )
     if world_size > 1 and not cfg.disable_viewer:
         cfg.disable_viewer = True
         if world_rank == 0:
