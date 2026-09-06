@@ -121,7 +121,7 @@ def select_gpu(requested_gpu_id):
 
 
 def split_root(split_name, resolution):
-    return DATASET_ROOT / f'{split_name}-set-exp' / 'objaverse' / str(resolution)
+    return DATASET_ROOT / f'{split_name}-set' / 'objaverse' / str(resolution)
 
 
 def build_render_command(obj_path, obj_output_dir, resolution):

@@ -110,7 +110,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def input_objaverse_root(dataset_root: Path, testset: bool = False) -> Path:
-    source_directory = "test-set-exp" if testset else "train-set"
+    source_directory = "test-set" if testset else "train-set"
     return dataset_root / source_directory / "objaverse"
 
 
