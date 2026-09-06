@@ -44,7 +44,11 @@ def parse_args():
         nargs='+',
         default=DEFAULT_RESOLUTIONS,
         metavar='RESOLUTION',
-        help='Native image resolutions to render (default: 512 256 128).',
+        help=(
+            'Image resolutions to generate. Only the largest resolution is '
+            'rendered natively; lower resolutions are downscaled with ffmpeg '
+            '(default: 512 128).'
+        ),
     )
     parser.add_argument(
         "--skip_gs",
@@ -170,6 +174,81 @@ def build_train_command(colmap_dir, output_dir, obj_id):
     ]
 
 
+def count_pngs(images_dir):
+    """Return the number of rendered PNGs in an images directory."""
+    if not images_dir.is_dir():
+        return 0
+    return sum(1 for path in images_dir.iterdir() if path.suffix == '.png')
+
+
+def write_scaled_camera_file(source_camera_path, target_camera_path, scale):
+    """Copy a SIMPLE_PINHOLE camera definition with scaled intrinsics."""
+    lines = source_camera_path.read_text(encoding='utf-8').splitlines()
+    output_lines = []
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith('#'):
+            output_lines.append(line)
+            continue
+
+        fields = stripped.split()
+        if len(fields) != 7 or fields[1] != 'SIMPLE_PINHOLE':
+            raise ValueError(
+                f'Expected SIMPLE_PINHOLE camera in {source_camera_path}, '
+                f'got: {line}'
+            )
+
+        width = int(fields[2])
+        height = int(fields[3])
+        focal, cx, cy = (float(value) for value in fields[4:])
+        output_lines.append(
+            f'{fields[0]} SIMPLE_PINHOLE '
+            f'{width * scale:.12g} {height * scale:.12g} '
+            f'{focal * scale:.12g} {cx * scale:.12g} {cy * scale:.12g}'
+        )
+
+    target_camera_path.parent.mkdir(parents=True, exist_ok=True)
+    target_camera_path.write_text('\n'.join(output_lines) + '\n', encoding='utf-8')
+
+
+def downscale_scene(source_colmap_dir, target_colmap_dir, source_resolution, target_resolution):
+    """Build a lower-resolution COLMAP dataset from a native render."""
+    source_images_dir = source_colmap_dir / 'images'
+    target_images_dir = target_colmap_dir / 'images'
+    source_images = sorted(
+        path for path in source_images_dir.iterdir() if path.suffix == '.png'
+    )
+
+    if len(source_images) < NUM_VIEWS:
+        raise RuntimeError(
+            f'Cannot downscale from {source_colmap_dir}: expected at least '
+            f'{NUM_VIEWS} PNGs, found {len(source_images)}.'
+        )
+
+    target_images_dir.mkdir(parents=True, exist_ok=True)
+    for source_image in source_images:
+        target_image = target_images_dir / source_image.name
+        ffmpeg_cmd = [
+            'ffmpeg', '-y', '-noautorotate', '-i', str(source_image),
+            '-q:v', '2', '-vf', f'scale={target_resolution}:{target_resolution}',
+            str(target_image),
+        ]
+        subprocess.run(ffmpeg_cmd, check=True)
+
+    source_sparse_dir = source_colmap_dir / 'sparse' / '0'
+    target_sparse_dir = target_colmap_dir / 'sparse' / '0'
+    target_sparse_dir.mkdir(parents=True, exist_ok=True)
+    for filename in ('images.txt', 'bbox.txt'):
+        shutil.copy2(source_sparse_dir / filename, target_sparse_dir / filename)
+    shutil.copy2(source_colmap_dir / 'metadata.json', target_colmap_dir / 'metadata.json')
+    write_scaled_camera_file(
+        source_sparse_dir / 'cameras.txt',
+        target_sparse_dir / 'cameras.txt',
+        target_resolution / source_resolution,
+    )
+
+
 def run_training(train_cmd, env):
     process = subprocess.Popen(
         train_cmd,
@@ -252,32 +331,64 @@ def main():
 
         print(f'\n=== Processing {obj_id} ({split_name}) ===')
         invalid_gaussians = False
+        native_resolution = max(args.resolutions)
+        native_colmap_dir = (
+            split_root(split_name, native_resolution) / 'colmap' / obj_id
+        )
+        native_images_dir = native_colmap_dir / 'images'
+
+        native_image_count = count_pngs(native_images_dir)
+        if native_image_count >= NUM_VIEWS:
+            print(
+                f'[SKIP] Native render exists at {native_resolution}: '
+                f'{native_image_count} images'
+            )
+        else:
+            render_cmd = build_render_command(
+                obj_path,
+                native_colmap_dir,
+                native_resolution,
+            )
+            print(f'\n--- Native resolution: {native_resolution} ---')
+            print('Running render:')
+            print(' '.join(render_cmd))
+            subprocess.run(render_cmd, env=env, check=True)
+
+        native_image_count = count_pngs(native_images_dir)
+        if native_image_count < NUM_VIEWS:
+            raise RuntimeError(
+                f'Native render for {obj_id} at {native_resolution} produced '
+                f'{native_image_count} images; expected at least {NUM_VIEWS}.'
+            )
+
+        for resolution in args.resolutions:
+            if resolution == native_resolution:
+                continue
+
+            colmap_dir = split_root(split_name, resolution) / 'colmap' / obj_id
+            images_dir = colmap_dir / 'images'
+            image_count = count_pngs(images_dir)
+            if image_count >= NUM_VIEWS:
+                print(
+                    f'[SKIP] Resolution {resolution} exists: '
+                    f'{image_count} images'
+                )
+                continue
+
+            print(
+                f'[DOWNSCALE] {obj_id}: {native_resolution} -> {resolution}'
+            )
+            downscale_scene(
+                native_colmap_dir,
+                colmap_dir,
+                native_resolution,
+                resolution,
+            )
 
         for resolution in args.resolutions:
             resolution_root = split_root(split_name, resolution)
             colmap_dir = resolution_root / 'colmap' / obj_id
-            images_dir = colmap_dir / 'images'
             output_dir = resolution_root / 'gsplat' / obj_id
-
-            print(f'\n--- Native resolution: {resolution} ---')
-
-            image_count = 0
-            if images_dir.is_dir():
-                image_count = sum(
-                    1 for path in images_dir.iterdir() if path.suffix == '.png'
-                )
-
-            if image_count >= NUM_VIEWS:
-                print(f'[SKIP] Render exists: {image_count} images')
-            else:
-                render_cmd = build_render_command(
-                    obj_path,
-                    colmap_dir,
-                    resolution,
-                )
-                print('Running render:')
-                print(' '.join(render_cmd))
-                subprocess.run(render_cmd, env=env, check=True)
 
             if args.skip_gs:
                 continue
