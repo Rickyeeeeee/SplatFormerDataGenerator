@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 
-DEFAULT_DATASET_ROOT = Path("/project/ricky/splatformer-sr-data-ds")
+DEFAULT_DATASET_ROOT = Path("/project/ricky/splatformer-sr-data-scaled")
 DEFAULT_OLD_RESOLUTION = 128
 DEFAULT_NEW_RESOLUTION = 512
 DEFAULT_PSNR_THRESHOLD = 27.0

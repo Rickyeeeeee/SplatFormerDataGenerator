@@ -10,7 +10,7 @@ from pathlib import Path
 
 # Local config
 OBJAVERSE_GLBS_ROOT = Path('/project/ricky/objaverse/glbs')
-DATASET_ROOT = Path('/project/ricky/splatformer-sr-data-ds')
+DATASET_ROOT = Path('/project/ricky/splatformer-sr-data-scaled')
 OBJAVERSE_TRAIN_SPLIT_FILE = Path('./traintest_splits/objaverse_train.txt')
 OBJAVERSE_TEST_SPLIT_FILE = Path('./traintest_splits/objaverse_test.txt')
 OBJAVERSE_FAILED_SPLIT_FILE = Path('./traintest_splits/objaverse_failed.txt')
@@ -234,6 +234,7 @@ def downscale_scene(source_colmap_dir, target_colmap_dir, source_resolution, tar
         ffmpeg_cmd = [
             'ffmpeg', '-y', '-noautorotate', '-i', str(source_image),
             '-q:v', '2', '-vf', f'scale={target_resolution}:{target_resolution}',
+            '-frames:v', '1', '-update', '1',
             str(target_image),
         ]
         subprocess.run(ffmpeg_cmd, check=True)
