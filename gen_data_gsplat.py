@@ -17,7 +17,7 @@ OBJAVERSE_FAILED_SPLIT_FILE = Path('./traintest_splits/objaverse_failed.txt')
 OBJAVERSE_BLENDER_BIN = 'blender-3.2.2-linux-x64/blender'
 RENDER_SCRIPT = 'render_full.py'
 NUM_VIEWS = 128
-DEFAULT_RESOLUTIONS = [512, 128]
+DEFAULT_RESOLUTIONS = [512, 32]
 # DEFAULT_RESOLUTIONS = [512, 256, 128]
 CHECKPOINT_NAME = 'ckpt_14999_rank0.pt'
 
