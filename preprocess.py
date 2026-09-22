@@ -14,8 +14,8 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 
 DEFAULT_DATASET_ROOT = Path("/project/ricky/splatformer-sr-data-scaled")
-DEFAULT_OLD_RESOLUTION = 128
-DEFAULT_NEW_RESOLUTION = 512
+DEFAULT_OLD_RESOLUTION = 32
+DEFAULT_NEW_RESOLUTION = 128
 DEFAULT_PSNR_THRESHOLD = 27.0
 EXPECTED_IMAGE_COUNT = 128
 SOURCE_CHECKPOINT_NAME = "ckpt_14999_rank0.pt"
@@ -30,7 +30,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Scan paired GSplat scenes, filter them by input PSNR, refine 128px "
-            "splats on 512px images, and calculate raw parameter statistics."
+            "splats on 512px images, and calculate raw and scene-normalized statistics."
         )
     )
     parser.add_argument(
@@ -96,6 +96,8 @@ def parse_args() -> argparse.Namespace:
             "instead of the train-set directories."
         ),
     )
+    parser.add_argument("--statistics_max_gs_num", type=int, default=1000_000, help="Maximum LR-selected Gaussians for normalized statistics (default: 100000).")
+    parser.add_argument("--statistics_remove_outlier_ndevs", type=float, default=0.0, help="LR position outlier threshold in standard deviations; 0 disables filtering.")
     args = parser.parse_args()
 
     if args.old_resolution <= 0 or args.new_resolution <= 0:
@@ -106,6 +108,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--psnr_threshold must be finite.")
     if args.gpu_id is not None and args.gpu_id < 0:
         parser.error("--gpu_id must be non-negative.")
+    if args.statistics_max_gs_num <= 0:
+        parser.error("--statistics_max_gs_num must be positive.")
+    if not math.isfinite(args.statistics_remove_outlier_ndevs) or args.statistics_remove_outlier_ndevs < 0:
+        parser.error("--statistics_remove_outlier_ndevs must be finite and non-negative.")
     return args
 
 
@@ -600,7 +606,8 @@ def tensor_statistics(value: Any) -> Dict[str, Any]:
 
 
 def compute_scene_statistics(
-    input_checkpoint: Path, output_checkpoint: Path
+    input_checkpoint: Path, output_checkpoint: Path,
+    statistics_max_gs_num: int = 100_000, statistics_remove_outlier_ndevs: float = 0.0,
 ) -> Tuple[Dict[str, Any], Dict[str, Tuple[int, ...]]]:
     torch = _import_torch()
     input_splats = load_splats(input_checkpoint)
@@ -642,6 +649,45 @@ def compute_scene_statistics(
         result["output"][key] = tensor_statistics(output_value)
         delta = output_value.detach().to(torch.float64) - input_value.detach().to(torch.float64)
         result["delta"][key] = tensor_statistics(delta)
+    # Match the loader's LR selection, preserving paired checkpoint row identities.
+    means = input_splats["means"]
+    mask = torch.ones(input_count, dtype=torch.bool)
+    if statistics_remove_outlier_ndevs > 0:
+        center = means.mean(dim=0)
+        radius = statistics_remove_outlier_ndevs * means.std(dim=0)
+        mask &= ((means >= center - radius) & (means <= center + radius)).all(dim=1)
+    indices = mask.nonzero(as_tuple=False).squeeze(1)[:statistics_max_gs_num]
+    if indices.numel() == 0:
+        raise ValueError("Gaussian filtering removed every splat")
+    selected_means = means[indices]
+
+    # Preserve aspect ratio and center each axis inside the LR-derived unit cube.
+    minimum = selected_means.min(dim=0).values
+    maximum = selected_means.max(dim=0).values
+    scale = (1.0 / (maximum - minimum)).min()
+    scaled_means = selected_means * scale
+    translation = 0.5 - (scaled_means.min(dim=0).values + scaled_means.max(dim=0).values) / 2
+    normalized = {
+        "selected_gaussian_count": int(indices.numel()),
+        "scale": scale.tolist(),
+        "translation": translation.tolist(),
+        "input": {}, "output": {}, "delta": {},
+    }
+    for key in ordered_keys:
+        input_value = input_splats[key][indices]
+        output_value = output_splats[key][indices]
+        if key == "means":
+            input_value = input_value * scale + translation
+            output_value = output_value * scale + translation
+        elif key == "scales":
+            input_value = input_value + torch.log(scale)
+            output_value = output_value + torch.log(scale)
+        delta = output_value.to(torch.float64) - input_value.to(torch.float64)
+        for group, value in (("input", input_value), ("output", output_value), ("delta", delta)):
+            summary = tensor_statistics(value)
+            summary["variance"] = value.to(torch.float64).var(dim=0, unbiased=False).tolist()
+            normalized[group][key] = summary
+    result["normalized"] = normalized
     return result, input_shapes
 
 
@@ -669,6 +715,7 @@ def aggregate_scene_statistics(scenes: Mapping[str, Dict[str, Any]]) -> Dict[str
             "input": {},
             "output": {},
             "delta": {},
+            "normalized": {"weighting": "equal_scene_mixture", "scene_count": 0, "input": {}, "output": {}, "delta": {}},
         }
 
     scene_values = list(scenes.values())
@@ -688,6 +735,20 @@ def aggregate_scene_statistics(scenes: Mapping[str, Dict[str, Any]]) -> Dict[str
                     [scene[group][key]["std"] for scene in scene_values]
                 ),
             }
+    # Combine within-scene variance and between-scene mean variation equally by scene.
+    normalized_scenes = [scene["normalized"] for scene in scene_values if "normalized" in scene]
+    if normalized_scenes:
+        torch = _import_torch()
+        normalized = {"weighting": "equal_scene_mixture", "scene_count": len(normalized_scenes)}
+        for group in ("input", "output", "delta"):
+            normalized[group] = {}
+            for key in normalized_scenes[0][group]:
+                means = torch.tensor([scene[group][key]["mean"] for scene in normalized_scenes], dtype=torch.float64)
+                variances = torch.tensor([scene[group][key]["variance"] for scene in normalized_scenes], dtype=torch.float64)
+                mean = means.mean(dim=0)
+                variance = (variances + (means - mean).square()).mean(dim=0)
+                normalized[group][key] = {"mean": mean.tolist(), "variance": variance.tolist(), "std": variance.sqrt().tolist()}
+        result["normalized"] = normalized
     return result
 
 
@@ -697,6 +758,8 @@ def calculate_statistics(
     dataset_root: Path,
     old_resolution: int,
     testset: bool = False,
+    statistics_max_gs_num: int = 100_000,
+    statistics_remove_outlier_ndevs: float = 0.0,
 ) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any], List[Dict[str, Any]]]:
     scenes: Dict[str, Dict[str, Any]] = {}
     failures: List[Dict[str, Any]] = []
@@ -715,7 +778,7 @@ def calculate_statistics(
         )
         try:
             scene_stats, shapes = compute_scene_statistics(
-                input_checkpoint, output_checkpoint
+                input_checkpoint, output_checkpoint, statistics_max_gs_num, statistics_remove_outlier_ndevs
             )
             if reference_shapes is None:
                 reference_shapes = shapes
@@ -875,6 +938,8 @@ def main() -> int:
         dataset_root,
         args.old_resolution,
         args.testset,
+        statistics_max_gs_num=args.statistics_max_gs_num,
+        statistics_remove_outlier_ndevs=args.statistics_remove_outlier_ndevs,
     )
     failures.extend(statistics_failures)
 
@@ -899,6 +964,17 @@ def main() -> int:
             "difference": "output_minus_input",
             "raw_parameter_space": True,
             "aggregate_weighting": "equal_scene_average",
+            "normalized_statistics": {
+                "coordinate_frame": "input_resolution",
+                "feature_range": [0.0, 1.0],
+                "preserve_ratio": True,
+                "scaler_fit": "selected_input_means",
+                "max_gs_num": args.statistics_max_gs_num,
+                "remove_outlier_ndevs": args.statistics_remove_outlier_ndevs,
+                "scale_representation": "log_scale_plus_log_coordinate_scale",
+                "aggregate_weighting": "equal_scene_mixture",
+                "variance": "mean_of_population_variances_plus_squared_scene_mean_offsets",
+            },
             "valid_scenes_csv": str(valid_csv),
             "filtered_scenes_csv": str(filtered_csv),
         },
