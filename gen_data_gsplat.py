@@ -9,17 +9,20 @@ import sys
 from pathlib import Path
 
 # Local config
+DEFAULT_MAX_SPLATS = 1000
+DEFAULT_BBOX_SEEDS = 500
 OBJAVERSE_GLBS_ROOT = Path('/project/ricky/objaverse/glbs')
-DATASET_ROOT = Path('/project/ricky/splatformer-sr-data-scaled')
+IMG_DATASET_ROOT = Path('/project/ricky/splatformer-sr-data-scaled')
+GS_DATASET_ROOT = Path(f'/project/ricky/splatformer-sr-data-mcmc-{DEFAULT_MAX_SPLATS}')
 OBJAVERSE_TRAIN_SPLIT_FILE = Path('./traintest_splits/objaverse_train.txt')
 OBJAVERSE_TEST_SPLIT_FILE = Path('./traintest_splits/objaverse_test.txt')
 OBJAVERSE_FAILED_SPLIT_FILE = Path('./traintest_splits/objaverse_failed.txt')
 OBJAVERSE_BLENDER_BIN = 'blender-3.2.2-linux-x64/blender'
 RENDER_SCRIPT = 'render_full.py'
 NUM_VIEWS = 128
-DEFAULT_RESOLUTIONS = [512, 32]
+DEFAULT_RESOLUTIONS = [64]
 # DEFAULT_RESOLUTIONS = [512, 256, 128]
-CHECKPOINT_NAME = 'ckpt_14999_rank0.pt'
+CHECKPOINT_NAME = 'ckpt_9999_rank0.pt'
 
 
 def parse_args():
@@ -55,6 +58,17 @@ def parse_args():
         type=bool,
         default=False,
     )
+    parser.add_argument(
+        '--max-splats',
+        type=int,
+        default=DEFAULT_MAX_SPLATS,
+        metavar='COUNT',
+        help=(
+            'Maximum splats per scene with gsplat MCMC '
+            f'(default: {DEFAULT_MAX_SPLATS}). '
+            f'Start with up to {DEFAULT_BBOX_SEEDS} bbox seed splats.'
+        ),
+    )
     args = parser.parse_args()
 
     if not re.fullmatch(r'000-\d{3}', args.partition):
@@ -63,6 +77,8 @@ def parse_args():
         parser.error('--resolutions values must all be positive integers.')
     if len(args.resolutions) != len(set(args.resolutions)):
         parser.error('--resolutions must not contain duplicate values.')
+    if args.max_splats < 4:
+        parser.error('--max-splats must be at least 4 for splat initialization.')
 
     return args
 
@@ -120,8 +136,14 @@ def select_gpu(requested_gpu_id):
     return None
 
 
-def split_root(split_name, resolution):
-    return DATASET_ROOT / f'{split_name}-set' / 'objaverse' / str(resolution)
+def split_root(dataset_root, split_name, resolution):
+    return dataset_root / f'{split_name}-set' / 'objaverse' / str(resolution)
+
+
+def gs_dataset_root(max_splats):
+    if max_splats == DEFAULT_MAX_SPLATS:
+        return GS_DATASET_ROOT
+    return GS_DATASET_ROOT.parent / f'splatformer-sr-data-mcmc-{max_splats}'
 
 
 def build_render_command(obj_path, obj_output_dir, resolution):
@@ -142,38 +164,38 @@ def build_render_command(obj_path, obj_output_dir, resolution):
     ]
 
 
-def build_train_command(colmap_dir, output_dir, obj_id):
-    return [
+def build_train_command(
+    colmap_dir, output_dir, obj_id, max_splats=DEFAULT_MAX_SPLATS
+):
+    bbox_seed_count = min(DEFAULT_BBOX_SEEDS, max_splats)
+    train_cmd = [
         'python',
         'trainer.py',
-        'default',
+        'mcmc',
         '--cache-images-on-gpu',
         '--disable_viewer',
         f'--data-dir={colmap_dir}',
         '--data-factor=1',
         f'--result-dir={output_dir}',
         '--test-every=-1',
-        '--max-steps=15000',
-        '--eval-steps=15000',
-        '--save-steps=15000',
+        '--max-steps=10000',
+        '--eval-steps=10000',
+        '--save-steps=10000',
         # '--save-ply',
         # '--ply-steps=15000',
         '--alpha-aware',
         '--disable-video',
         '--init-type=sfm',
         '--load-bbox',
-        '--num-points-from-bbox=50000',
+        f'--num-points-from-bbox={bbox_seed_count}',
         '--no-normalize-world-space',
-        '--sh-degree=1',
+        '--sh-degree=0',
         '--tb-every=0',
-        '--strategy.refine-stop-iter=15000',
-        '--strategy.grow-stop-iter=10000',
-        '--strategy.prune-stop-iter=15000',
-        '--strategy.prune-opa=0.1',
-        # '--strategy.absgrad',
-        # '--strategy.grow-grad2d=0.0008',
+        f'--strategy.cap-max={max_splats}',
+        '--strategy.refine-stop-iter=10000',
         '--strategy.no-verbose',
     ]
+    return train_cmd
 
 
 def count_pngs(images_dir):
@@ -276,10 +298,10 @@ def run_training(train_cmd, env):
         )
 
 
-def cleanup_scene_models(split_name, resolutions, obj_id):
+def cleanup_scene_models(gs_root, split_name, resolutions, obj_id):
     for resolution in resolutions:
         scene_output_dir = (
-            split_root(split_name, resolution) / 'gsplat' / obj_id
+            split_root(gs_root, split_name, resolution) / 'gsplat' / obj_id
         )
         if scene_output_dir.exists():
             shutil.rmtree(scene_output_dir, ignore_errors=True)
@@ -288,6 +310,7 @@ def cleanup_scene_models(split_name, resolutions, obj_id):
 def main():
     args = parse_args()
     path_to_objaverse = OBJAVERSE_GLBS_ROOT / args.partition
+    gs_root = gs_dataset_root(args.max_splats)
 
     train_ids = load_ids(OBJAVERSE_TRAIN_SPLIT_FILE)
     test_ids = load_ids(OBJAVERSE_TEST_SPLIT_FILE)
@@ -336,7 +359,8 @@ def main():
         invalid_gaussians = False
         native_resolution = max(args.resolutions)
         native_colmap_dir = (
-            split_root(split_name, native_resolution) / 'colmap' / obj_id
+            split_root(IMG_DATASET_ROOT, split_name, native_resolution)
+            / 'colmap' / obj_id
         )
         native_images_dir = native_colmap_dir / 'images'
 
@@ -368,7 +392,10 @@ def main():
             if resolution == native_resolution:
                 continue
 
-            colmap_dir = split_root(split_name, resolution) / 'colmap' / obj_id
+            colmap_dir = (
+                split_root(IMG_DATASET_ROOT, split_name, resolution)
+                / 'colmap' / obj_id
+            )
             images_dir = colmap_dir / 'images'
             image_count = count_pngs(images_dir)
             if image_count >= NUM_VIEWS:
@@ -389,9 +416,13 @@ def main():
             )
 
         for resolution in args.resolutions:
-            resolution_root = split_root(split_name, resolution)
-            colmap_dir = resolution_root / 'colmap' / obj_id
-            output_dir = resolution_root / 'gsplat' / obj_id
+            colmap_dir = (
+                split_root(IMG_DATASET_ROOT, split_name, resolution)
+                / 'colmap' / obj_id
+            )
+            output_dir = (
+                split_root(gs_root, split_name, resolution) / 'gsplat' / obj_id
+            )
 
             if args.skip_gs:
                 continue
@@ -408,7 +439,9 @@ def main():
                 )
                 continue
 
-            train_cmd = build_train_command(colmap_dir, output_dir, obj_id)
+            train_cmd = build_train_command(
+                colmap_dir, output_dir, obj_id, max_splats=args.max_splats
+            )
             print(f'\n[TRAIN] {obj_id} at resolution {resolution}')
             print(' '.join(train_cmd))
 
@@ -430,6 +463,7 @@ def main():
                     )
                     mark_failed_scene(obj_id, failed_ids)
                     cleanup_scene_models(
+                        gs_root,
                         split_name,
                         args.resolutions,
                         obj_id,
