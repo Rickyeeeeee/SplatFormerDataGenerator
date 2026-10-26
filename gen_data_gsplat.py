@@ -9,8 +9,8 @@ import sys
 from pathlib import Path
 
 # Local config
-DEFAULT_MAX_SPLATS = 1000
-DEFAULT_BBOX_SEEDS = 500
+DEFAULT_MAX_SPLATS = 8000
+DEFAULT_BBOX_SEEDS = DEFAULT_MAX_SPLATS // 2
 OBJAVERSE_GLBS_ROOT = Path('/project/ricky/objaverse/glbs')
 IMG_DATASET_ROOT = Path('/project/ricky/splatformer-sr-data-scaled')
 GS_DATASET_ROOT = Path(f'/project/ricky/splatformer-sr-data-mcmc-{DEFAULT_MAX_SPLATS}')
@@ -20,7 +20,7 @@ OBJAVERSE_FAILED_SPLIT_FILE = Path('./traintest_splits/objaverse_failed.txt')
 OBJAVERSE_BLENDER_BIN = 'blender-3.2.2-linux-x64/blender'
 RENDER_SCRIPT = 'render_full.py'
 NUM_VIEWS = 128
-DEFAULT_RESOLUTIONS = [64]
+DEFAULT_RESOLUTIONS = [512]
 # DEFAULT_RESOLUTIONS = [512, 256, 128]
 CHECKPOINT_NAME = 'ckpt_9999_rank0.pt'
 
@@ -167,7 +167,7 @@ def build_render_command(obj_path, obj_output_dir, resolution):
 def build_train_command(
     colmap_dir, output_dir, obj_id, max_splats=DEFAULT_MAX_SPLATS
 ):
-    bbox_seed_count = min(DEFAULT_BBOX_SEEDS, max_splats)
+    bbox_seed_count = min(max_splats // 2, max_splats)
     train_cmd = [
         'python',
         'trainer.py',

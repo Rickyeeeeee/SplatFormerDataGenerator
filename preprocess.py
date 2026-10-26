@@ -4,69 +4,56 @@ import argparse
 import csv
 import json
 import math
-import os
-import subprocess
+import pickle
 import sys
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 
-DEFAULT_DATASET_ROOT = Path("/project/ricky/splatformer-sr-data-scaled")
-DEFAULT_OLD_RESOLUTION = 32
-DEFAULT_NEW_RESOLUTION = 128
-DEFAULT_PSNR_THRESHOLD = 27.0
+DEFAULT_IMAGE_DATASET_ROOT = Path("/project/ricky/splatformer-sr-data-scaled")
+DEFAULT_GS_DATASET_ROOT = Path("/project/ricky/splatformer-sr-data-mcmc-4000")
+DEFAULT_RESOLUTION = 128
+DEFAULT_PSNR_THRESHOLD = 23.0
 EXPECTED_IMAGE_COUNT = 128
-SOURCE_CHECKPOINT_NAME = "ckpt_14999_rank0.pt"
-SOURCE_STATS_NAME = "val_step14999.json"
-REFINER_STEPS = 3_000
-REFINED_CHECKPOINT_NAME = "ckpt_2999_rank0.pt"
+SOURCE_CHECKPOINT_NAME = "ckpt_9999_rank0.pt"
+SOURCE_STATS_NAME = "val_step9999.json"
 REQUIRED_METRICS = ("num_GS", "psnr", "ssim", "lpips", "ellipse_time")
-REQUIRED_SPLAT_KEYS = ("means", "scales", "quats", "opacities", "sh0", "shN")
+REQUIRED_SPLAT_KEYS = ("means", "scales", "quats", "opacities", "sh0")
+OPTIONAL_SPLAT_KEYS = ("shN",)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Scan paired GSplat scenes, filter them by input PSNR, refine 128px "
-            "splats on 512px images, and calculate raw and scene-normalized statistics."
+            "Scan single-resolution MCMC GSplat scenes, filter by PSNR, "
+            "and calculate raw and scene-normalized checkpoint statistics."
         )
     )
     parser.add_argument(
-        "--dataset_root",
+        "--image_dataset_root",
         type=Path,
-        default=DEFAULT_DATASET_ROOT,
-        help=f"Dataset root containing train-set or test-set (default: {DEFAULT_DATASET_ROOT}).",
+        default=DEFAULT_IMAGE_DATASET_ROOT,
+        help=f"Root containing COLMAP images (default: {DEFAULT_IMAGE_DATASET_ROOT}).",
     )
     parser.add_argument(
-        "--old_resolution",
-        type=int,
-        default=DEFAULT_OLD_RESOLUTION,
-        help="Source GS/image resolution (default: 128).",
+        "--gs_dataset_root",
+        type=Path,
+        default=DEFAULT_GS_DATASET_ROOT,
+        help=f"Root containing MCMC checkpoints (default: {DEFAULT_GS_DATASET_ROOT}).",
     )
     parser.add_argument(
-        "--new_resolution",
+        "--resolution",
         type=int,
-        default=DEFAULT_NEW_RESOLUTION,
-        help="Target image resolution (default: 512).",
+        default=DEFAULT_RESOLUTION,
+        help=f"Image and GS resolution (default: {DEFAULT_RESOLUTION}).",
     )
     parser.add_argument(
         "--psnr_threshold",
         type=float,
         default=DEFAULT_PSNR_THRESHOLD,
-        help="Inclusive source-resolution PSNR threshold (default: 27).",
-    )
-    parser.add_argument(
-        "--gpu_id",
-        type=int,
-        default=None,
-        help="GPU index for refinement. If omitted, select the first idle GPU.",
-    )
-    parser.add_argument(
-        "--force",
-        action="store_true",
-        help="Run refinement even when the expected final checkpoint exists.",
+        help="Inclusive PSNR threshold (default: 27).",
     )
     parser.add_argument(
         "--scan",
@@ -79,35 +66,23 @@ def parse_args() -> argparse.Namespace:
         help="Regenerate psnr_filtered_scenes.csv even when it already exists.",
     )
     parser.add_argument(
-        "--refine",
-        action="store_true",
-        help="Run the refinement stage for filtered scenes.",
-    )
-    parser.add_argument(
         "--statistics",
         action="store_true",
-        help="Regenerate gs_statistics.json from available refined checkpoints.",
+        help="Regenerate gs_statistics.json from filtered MCMC checkpoints.",
     )
     parser.add_argument(
         "--testset",
         action="store_true",
-        help=(
-            "Use test-set as input and test-set-4x-up as refinement output "
-            "instead of the train-set directories."
-        ),
+        help="Use test-set images and MCMC checkpoints instead of train-set.",
     )
-    parser.add_argument("--statistics_max_gs_num", type=int, default=1000_000, help="Maximum LR-selected Gaussians for normalized statistics (default: 100000).")
-    parser.add_argument("--statistics_remove_outlier_ndevs", type=float, default=0.0, help="LR position outlier threshold in standard deviations; 0 disables filtering.")
+    parser.add_argument("--statistics_max_gs_num", type=int, default=1_000_000, help="Maximum selected Gaussians for normalized statistics (default: 1000000).")
+    parser.add_argument("--statistics_remove_outlier_ndevs", type=float, default=0.0, help="Position outlier threshold in standard deviations; 0 disables filtering.")
     args = parser.parse_args()
 
-    if args.old_resolution <= 0 or args.new_resolution <= 0:
-        parser.error("--old_resolution and --new_resolution must be positive.")
-    if args.old_resolution == args.new_resolution:
-        parser.error("--old_resolution and --new_resolution must differ.")
+    if args.resolution <= 0:
+        parser.error("--resolution must be positive.")
     if not math.isfinite(args.psnr_threshold):
         parser.error("--psnr_threshold must be finite.")
-    if args.gpu_id is not None and args.gpu_id < 0:
-        parser.error("--gpu_id must be non-negative.")
     if args.statistics_max_gs_num <= 0:
         parser.error("--statistics_max_gs_num must be positive.")
     if not math.isfinite(args.statistics_remove_outlier_ndevs) or args.statistics_remove_outlier_ndevs < 0:
@@ -116,13 +91,8 @@ def parse_args() -> argparse.Namespace:
 
 
 def input_objaverse_root(dataset_root: Path, testset: bool = False) -> Path:
-    source_directory = "test-set" if testset else "train-set"
-    return dataset_root / source_directory / "objaverse"
-
-
-def refined_objaverse_root(dataset_root: Path, testset: bool = False) -> Path:
-    output_directory = "test-set-4x-up" if testset else "train-set-4x-up"
-    return dataset_root / output_directory / "objaverse"
+    split_directory = "test-set" if testset else "train-set"
+    return dataset_root / split_directory / "objaverse"
 
 
 def resolution_root(
@@ -132,13 +102,13 @@ def resolution_root(
 
 
 def source_checkpoint_path(
-    dataset_root: Path,
+    gs_dataset_root: Path,
     resolution: int,
     scene_id: str,
     testset: bool = False,
 ) -> Path:
     return (
-        resolution_root(dataset_root, resolution, testset)
+        resolution_root(gs_dataset_root, resolution, testset)
         / "gsplat"
         / scene_id
         / "ckpts"
@@ -147,13 +117,13 @@ def source_checkpoint_path(
 
 
 def source_stats_path(
-    dataset_root: Path,
+    gs_dataset_root: Path,
     resolution: int,
     scene_id: str,
     testset: bool = False,
 ) -> Path:
     return (
-        resolution_root(dataset_root, resolution, testset)
+        resolution_root(gs_dataset_root, resolution, testset)
         / "gsplat"
         / scene_id
         / "stats"
@@ -161,48 +131,8 @@ def source_stats_path(
     )
 
 
-def refined_scene_dir(
-    dataset_root: Path,
-    old_resolution: int,
-    scene_id: str,
-    testset: bool = False,
-) -> Path:
-    return (
-        refined_objaverse_root(dataset_root, testset)
-        / str(old_resolution)
-        / "gsplat"
-        / scene_id
-    )
-
-
-def refined_checkpoint_path(
-    dataset_root: Path,
-    old_resolution: int,
-    scene_id: str,
-    testset: bool = False,
-) -> Path:
-    return (
-        refined_scene_dir(dataset_root, old_resolution, scene_id, testset)
-        / "ckpts"
-        / REFINED_CHECKPOINT_NAME
-    )
-
-
-def csv_fieldnames(resolutions: Sequence[int]) -> List[str]:
-    fields = ["scene_id"]
-    for resolution in resolutions:
-        prefix = f"res_{resolution}"
-        fields.extend(
-            [
-                f"{prefix}_image_count",
-                f"{prefix}_num_gs",
-                f"{prefix}_psnr",
-                f"{prefix}_ssim",
-                f"{prefix}_lpips",
-                f"{prefix}_ellipse_time",
-            ]
-        )
-    return fields
+def csv_fieldnames() -> List[str]:
+    return ["scene_id", "image_count", "num_gs", "psnr", "ssim", "lpips", "ellipse_time"]
 
 
 def _child_directory_names(path: Path) -> set:
@@ -212,15 +142,15 @@ def _child_directory_names(path: Path) -> set:
 
 
 def discover_scene_ids(
-    dataset_root: Path,
-    resolutions: Iterable[int],
+    image_dataset_root: Path,
+    gs_dataset_root: Path,
+    resolution: int,
     testset: bool = False,
 ) -> List[str]:
-    scene_ids = set()
-    for resolution in resolutions:
-        root = resolution_root(dataset_root, resolution, testset)
-        scene_ids.update(_child_directory_names(root / "colmap"))
-        scene_ids.update(_child_directory_names(root / "gsplat"))
+    image_root = resolution_root(image_dataset_root, resolution, testset)
+    gs_root = resolution_root(gs_dataset_root, resolution, testset)
+    scene_ids = _child_directory_names(image_root / "colmap")
+    scene_ids.update(_child_directory_names(gs_root / "gsplat"))
     return sorted(scene_ids)
 
 
@@ -265,13 +195,14 @@ def load_render_metrics(path: Path) -> Dict[str, Any]:
 
 
 def inspect_scene_resolution(
-    dataset_root: Path,
+    image_dataset_root: Path,
+    gs_dataset_root: Path,
     resolution: int,
     scene_id: str,
     testset: bool = False,
 ) -> Dict[str, Any]:
     images_dir = (
-        resolution_root(dataset_root, resolution, testset)
+        resolution_root(image_dataset_root, resolution, testset)
         / "colmap"
         / scene_id
         / "images"
@@ -283,13 +214,13 @@ def inspect_scene_resolution(
         )
 
     checkpoint_path = source_checkpoint_path(
-        dataset_root, resolution, scene_id, testset
+        gs_dataset_root, resolution, scene_id, testset
     )
     if not checkpoint_path.is_file():
         raise FileNotFoundError(f"Missing checkpoint: {checkpoint_path}")
 
     metrics = load_render_metrics(
-        source_stats_path(dataset_root, resolution, scene_id, testset)
+        source_stats_path(gs_dataset_root, resolution, scene_id, testset)
     )
     return {
         "image_count": image_count,
@@ -302,23 +233,22 @@ def inspect_scene_resolution(
 
 
 def scan_valid_scenes(
-    dataset_root: Path,
-    resolutions: Sequence[int],
+    image_dataset_root: Path,
+    gs_dataset_root: Path,
+    resolution: int,
     testset: bool = False,
 ) -> Tuple[List[Dict[str, Any]], Counter]:
     rows: List[Dict[str, Any]] = []
     invalid_reasons: Counter = Counter()
 
-    for scene_id in discover_scene_ids(dataset_root, resolutions, testset):
+    for scene_id in discover_scene_ids(
+        image_dataset_root, gs_dataset_root, resolution, testset
+    ):
         row: Dict[str, Any] = {"scene_id": scene_id}
         try:
-            for resolution in resolutions:
-                values = inspect_scene_resolution(
-                    dataset_root, resolution, scene_id, testset
-                )
-                prefix = f"res_{resolution}"
-                for name, value in values.items():
-                    row[f"{prefix}_{name}"] = value
+            row.update(inspect_scene_resolution(
+                image_dataset_root, gs_dataset_root, resolution, scene_id, testset
+            ))
         except FileNotFoundError:
             invalid_reasons["missing_file"] += 1
             continue
@@ -334,10 +264,10 @@ def scan_valid_scenes(
 
 
 def write_scene_csv(
-    rows: Sequence[Dict[str, Any]], path: Path, resolutions: Sequence[int]
+    rows: List[Dict[str, Any]], path: Path
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    fields = csv_fieldnames(resolutions)
+    fields = csv_fieldnames()
     with path.open("w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fields)
         writer.writeheader()
@@ -345,8 +275,8 @@ def write_scene_csv(
             writer.writerow({field: row[field] for field in fields})
 
 
-def load_scene_csv(path: Path, resolutions: Sequence[int]) -> List[Dict[str, Any]]:
-    expected_fields = csv_fieldnames(resolutions)
+def load_scene_csv(path: Path) -> List[Dict[str, Any]]:
+    expected_fields = csv_fieldnames()
     with path.open("r", encoding="utf-8", newline="") as f:
         reader = csv.DictReader(f)
         if reader.fieldnames != expected_fields:
@@ -355,9 +285,7 @@ def load_scene_csv(path: Path, resolutions: Sequence[int]) -> List[Dict[str, Any
             )
         rows = list(reader)
 
-    integer_fields = {
-        f"res_{resolution}_image_count" for resolution in resolutions
-    } | {f"res_{resolution}_num_gs" for resolution in resolutions}
+    integer_fields = {"image_count", "num_gs"}
     numeric_fields = set(expected_fields) - {"scene_id"} - integer_fields
     parsed_rows: List[Dict[str, Any]] = []
     for row_number, row in enumerate(rows, start=2):
@@ -378,166 +306,9 @@ def load_scene_csv(path: Path, resolutions: Sequence[int]) -> List[Dict[str, Any
 
 
 def filter_scenes(
-    rows: Sequence[Dict[str, Any]], old_resolution: int, psnr_threshold: float
+    rows: List[Dict[str, Any]], psnr_threshold: float
 ) -> List[Dict[str, Any]]:
-    psnr_key = f"res_{old_resolution}_psnr"
-    return [row for row in rows if float(row[psnr_key]) >= psnr_threshold]
-
-
-def select_gpu(requested_gpu_id: Optional[int]) -> Optional[str]:
-    if requested_gpu_id is not None:
-        return str(requested_gpu_id)
-    try:
-        result = subprocess.run(
-            [
-                "nvidia-smi",
-                "--query-gpu=utilization.gpu",
-                "--format=csv,noheader,nounits",
-            ],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-    except (subprocess.CalledProcessError, FileNotFoundError) as exc:
-        print(f"[ERROR] Failed to query GPUs: {exc}")
-        return None
-
-    for gpu_id, line in enumerate(result.stdout.splitlines()):
-        if line.strip() == "0":
-            return str(gpu_id)
-    print("[ERROR] No idle GPU found.")
-    return None
-
-
-def build_refiner_command(
-    dataset_root: Path,
-    old_resolution: int,
-    new_resolution: int,
-    scene_id: str,
-    refiner_path: Path,
-    testset: bool = False,
-) -> List[str]:
-    init_checkpoint = source_checkpoint_path(
-        dataset_root, old_resolution, scene_id, testset
-    )
-    old_data_dir = (
-        resolution_root(dataset_root, old_resolution, testset)
-        / "colmap"
-        / scene_id
-    )
-    new_data_dir = (
-        resolution_root(dataset_root, new_resolution, testset)
-        / "colmap"
-        / scene_id
-    )
-    result_dir = refined_scene_dir(
-        dataset_root, old_resolution, scene_id, testset
-    )
-    return [
-        sys.executable,
-        str(refiner_path),
-        "default",
-        "--cache-images-on-gpu",
-        "--disable_viewer",
-        f"--init-ckpt={init_checkpoint}",
-        f"--old-data-dir={old_data_dir}",
-        f"--new-data-dir={new_data_dir}",
-        f"--result-dir={result_dir}",
-        "--data-factor=1",
-        "--test-every=-1",
-        f"--max-steps={REFINER_STEPS}",
-        f"--eval-steps={REFINER_STEPS}",
-        f"--save-steps={REFINER_STEPS}",
-        "--alpha-aware",
-        "--disable-video",
-        "--init-type=sfm",
-        "--load-bbox",
-        "--num-points-from-bbox=50000",
-        "--no-normalize-world-space",
-        "--batch-size",
-        "4",
-        "--sh-degree=1",
-        "--tb-every=0",
-        "--strategy.refine-start-iter=1000000",
-    ]
-
-
-def run_refinements(
-    rows: Sequence[Dict[str, Any]],
-    dataset_root: Path,
-    old_resolution: int,
-    new_resolution: int,
-    gpu_id: Optional[int],
-    force: bool,
-    refiner_path: Path,
-    testset: bool = False,
-) -> Tuple[Dict[str, str], List[Dict[str, Any]]]:
-    statuses: Dict[str, str] = {}
-    failures: List[Dict[str, Any]] = []
-    pending: List[str] = []
-
-    for row in rows:
-        scene_id = str(row["scene_id"])
-        final_checkpoint = refined_checkpoint_path(
-            dataset_root, old_resolution, scene_id, testset
-        )
-        if final_checkpoint.is_file() and not force:
-            statuses[scene_id] = "reused"
-        else:
-            pending.append(scene_id)
-
-    selected_gpu = select_gpu(gpu_id) if pending else None
-    if pending and selected_gpu is None:
-        for scene_id in pending:
-            statuses[scene_id] = "refinement_failed"
-            failures.append(
-                {
-                    "scene_id": scene_id,
-                    "stage": "refinement",
-                    "error": "No GPU was available for refinement.",
-                }
-            )
-        return statuses, failures
-
-    env = dict(os.environ)
-    if selected_gpu is not None:
-        env["CUDA_VISIBLE_DEVICES"] = selected_gpu
-
-    for scene_id in pending:
-        command = build_refiner_command(
-            dataset_root,
-            old_resolution,
-            new_resolution,
-            scene_id,
-            refiner_path,
-            testset,
-        )
-        print(f"\n[REFINE] {scene_id} on GPU {selected_gpu}")
-        print(" ".join(command))
-        try:
-            subprocess.run(command, env=env, check=True)
-            final_checkpoint = refined_checkpoint_path(
-                dataset_root, old_resolution, scene_id, testset
-            )
-            if not final_checkpoint.is_file():
-                raise FileNotFoundError(
-                    f"Refiner completed without producing {final_checkpoint}"
-                )
-        except (OSError, subprocess.CalledProcessError) as exc:
-            statuses[scene_id] = "refinement_failed"
-            failure: Dict[str, Any] = {
-                "scene_id": scene_id,
-                "stage": "refinement",
-                "error": str(exc),
-            }
-            if isinstance(exc, subprocess.CalledProcessError):
-                failure["returncode"] = exc.returncode
-            failures.append(failure)
-            print(f"[ERROR] Refinement failed for {scene_id}: {exc}")
-            continue
-        statuses[scene_id] = "refined"
-
-    return statuses, failures
+    return [row for row in rows if float(row["psnr"]) >= psnr_threshold]
 
 
 def _import_torch():
@@ -606,52 +377,26 @@ def tensor_statistics(value: Any) -> Dict[str, Any]:
 
 
 def compute_scene_statistics(
-    input_checkpoint: Path, output_checkpoint: Path,
-    statistics_max_gs_num: int = 100_000, statistics_remove_outlier_ndevs: float = 0.0,
+    checkpoint_path: Path,
+    statistics_max_gs_num: int = 1_000_000,
+    statistics_remove_outlier_ndevs: float = 0.0,
 ) -> Tuple[Dict[str, Any], Dict[str, Tuple[int, ...]]]:
     torch = _import_torch()
-    input_splats = load_splats(input_checkpoint)
-    output_splats = load_splats(output_checkpoint)
-    input_keys = set(input_splats.keys())
-    output_keys = set(output_splats.keys())
-    if input_keys != output_keys:
-        raise ValueError(
-            "Input/output splat keys differ: "
-            f"missing_from_output={sorted(input_keys - output_keys)}, "
-            f"missing_from_input={sorted(output_keys - input_keys)}."
-        )
-
-    input_count, input_shapes = _validate_splat_mapping(input_splats, input_checkpoint)
-    output_count, output_shapes = _validate_splat_mapping(output_splats, output_checkpoint)
-    if input_count != output_count:
-        raise ValueError(
-            f"Input/output splat counts differ: {input_count} != {output_count}."
-        )
-    if input_shapes != output_shapes:
-        raise ValueError(
-            f"Input/output splat parameter shapes differ: {input_shapes} != {output_shapes}."
-        )
+    splats = load_splats(checkpoint_path)
+    count, shapes = _validate_splat_mapping(splats, checkpoint_path)
 
     result: Dict[str, Any] = {
-        "num_splats": input_count,
-        "input_checkpoint": str(input_checkpoint),
-        "output_checkpoint": str(output_checkpoint),
-        "input": {},
-        "output": {},
-        "delta": {},
+        "num_splats": count,
+        "checkpoint": str(checkpoint_path),
+        "raw": {},
     }
-    ordered_keys = [key for key in REQUIRED_SPLAT_KEYS if key in input_keys]
-    ordered_keys.extend(sorted(input_keys - set(ordered_keys)))
+    keys = set(splats)
+    ordered_keys = [key for key in (*REQUIRED_SPLAT_KEYS, *OPTIONAL_SPLAT_KEYS) if key in keys]
+    ordered_keys.extend(sorted(keys - set(ordered_keys)))
     for key in ordered_keys:
-        input_value = input_splats[key]
-        output_value = output_splats[key]
-        result["input"][key] = tensor_statistics(input_value)
-        result["output"][key] = tensor_statistics(output_value)
-        delta = output_value.detach().to(torch.float64) - input_value.detach().to(torch.float64)
-        result["delta"][key] = tensor_statistics(delta)
-    # Match the loader's LR selection, preserving paired checkpoint row identities.
-    means = input_splats["means"]
-    mask = torch.ones(input_count, dtype=torch.bool)
+        result["raw"][key] = tensor_statistics(splats[key])
+    means = splats["means"]
+    mask = torch.ones(count, dtype=torch.bool)
     if statistics_remove_outlier_ndevs > 0:
         center = means.mean(dim=0)
         radius = statistics_remove_outlier_ndevs * means.std(dim=0)
@@ -661,34 +406,30 @@ def compute_scene_statistics(
         raise ValueError("Gaussian filtering removed every splat")
     selected_means = means[indices]
 
-    # Preserve aspect ratio and center each axis inside the LR-derived unit cube.
+    # Preserve aspect ratio and center each axis inside the unit cube.
     minimum = selected_means.min(dim=0).values
     maximum = selected_means.max(dim=0).values
-    scale = (1.0 / (maximum - minimum)).min()
+    extent = (maximum - minimum).max()
+    scale = 1.0 / extent if extent > 0 else torch.ones_like(extent)
     scaled_means = selected_means * scale
     translation = 0.5 - (scaled_means.min(dim=0).values + scaled_means.max(dim=0).values) / 2
     normalized = {
         "selected_gaussian_count": int(indices.numel()),
         "scale": scale.tolist(),
         "translation": translation.tolist(),
-        "input": {}, "output": {}, "delta": {},
+        "parameters": {},
     }
     for key in ordered_keys:
-        input_value = input_splats[key][indices]
-        output_value = output_splats[key][indices]
+        value = splats[key][indices]
         if key == "means":
-            input_value = input_value * scale + translation
-            output_value = output_value * scale + translation
+            value = value * scale + translation
         elif key == "scales":
-            input_value = input_value + torch.log(scale)
-            output_value = output_value + torch.log(scale)
-        delta = output_value.to(torch.float64) - input_value.to(torch.float64)
-        for group, value in (("input", input_value), ("output", output_value), ("delta", delta)):
-            summary = tensor_statistics(value)
-            summary["variance"] = value.to(torch.float64).var(dim=0, unbiased=False).tolist()
-            normalized[group][key] = summary
+            value = value + torch.log(scale)
+        summary = tensor_statistics(value)
+        summary["variance"] = value.to(torch.float64).var(dim=0, unbiased=False).tolist()
+        normalized["parameters"][key] = summary
     result["normalized"] = normalized
-    return result, input_shapes
+    return result, shapes
 
 
 def _average_nested(values: Sequence[Any]) -> Any:
@@ -712,10 +453,9 @@ def aggregate_scene_statistics(scenes: Mapping[str, Dict[str, Any]]) -> Dict[str
         return {
             "weighting": "equal_scene_average",
             "scene_count": 0,
-            "input": {},
-            "output": {},
-            "delta": {},
-            "normalized": {"weighting": "equal_scene_mixture", "scene_count": 0, "input": {}, "output": {}, "delta": {}},
+            "parameter_scene_counts": {},
+            "raw": {},
+            "normalized": {"weighting": "equal_scene_mixture", "scene_count": 0, "parameters": {}},
         }
 
     scene_values = list(scenes.values())
@@ -723,72 +463,74 @@ def aggregate_scene_statistics(scenes: Mapping[str, Dict[str, Any]]) -> Dict[str
         "weighting": "equal_scene_average",
         "scene_count": len(scene_values),
     }
-    for group in ("input", "output", "delta"):
-        result[group] = {}
-        parameter_keys = list(scene_values[0][group].keys())
-        for key in parameter_keys:
-            result[group][key] = {
-                "mean": _average_nested(
-                    [scene[group][key]["mean"] for scene in scene_values]
-                ),
-                "std": _average_nested(
-                    [scene[group][key]["std"] for scene in scene_values]
-                ),
-            }
+    result["raw"] = {}
+    parameter_keys = list(dict.fromkeys(
+        key for scene in scene_values for key in scene["raw"]
+    ))
+    result["parameter_scene_counts"] = {}
+    for key in parameter_keys:
+        matching_scenes = [scene for scene in scene_values if key in scene["raw"]]
+        result["parameter_scene_counts"][key] = len(matching_scenes)
+        result["raw"][key] = {
+            "mean": _average_nested([scene["raw"][key]["mean"] for scene in matching_scenes]),
+            "std": _average_nested([scene["raw"][key]["std"] for scene in matching_scenes]),
+        }
     # Combine within-scene variance and between-scene mean variation equally by scene.
-    normalized_scenes = [scene["normalized"] for scene in scene_values if "normalized" in scene]
-    if normalized_scenes:
-        torch = _import_torch()
-        normalized = {"weighting": "equal_scene_mixture", "scene_count": len(normalized_scenes)}
-        for group in ("input", "output", "delta"):
-            normalized[group] = {}
-            for key in normalized_scenes[0][group]:
-                means = torch.tensor([scene[group][key]["mean"] for scene in normalized_scenes], dtype=torch.float64)
-                variances = torch.tensor([scene[group][key]["variance"] for scene in normalized_scenes], dtype=torch.float64)
-                mean = means.mean(dim=0)
-                variance = (variances + (means - mean).square()).mean(dim=0)
-                normalized[group][key] = {"mean": mean.tolist(), "variance": variance.tolist(), "std": variance.sqrt().tolist()}
-        result["normalized"] = normalized
+    torch = _import_torch()
+    normalized = {"weighting": "equal_scene_mixture", "scene_count": len(scene_values), "parameters": {}}
+    for key in parameter_keys:
+        matching_scenes = [scene for scene in scene_values if key in scene["normalized"]["parameters"]]
+        means = torch.tensor([scene["normalized"]["parameters"][key]["mean"] for scene in matching_scenes], dtype=torch.float64)
+        variances = torch.tensor([scene["normalized"]["parameters"][key]["variance"] for scene in matching_scenes], dtype=torch.float64)
+        mean = means.mean(dim=0)
+        variance = (variances + (means - mean).square()).mean(dim=0)
+        normalized["parameters"][key] = {"mean": mean.tolist(), "variance": variance.tolist(), "std": variance.sqrt().tolist()}
+    result["normalized"] = normalized
     return result
 
 
 def calculate_statistics(
     rows: Sequence[Dict[str, Any]],
-    statuses: Dict[str, str],
-    dataset_root: Path,
-    old_resolution: int,
+    gs_dataset_root: Path,
+    resolution: int,
     testset: bool = False,
-    statistics_max_gs_num: int = 100_000,
+    statistics_max_gs_num: int = 1_000_000,
     statistics_remove_outlier_ndevs: float = 0.0,
 ) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any], List[Dict[str, Any]]]:
     scenes: Dict[str, Dict[str, Any]] = {}
     failures: List[Dict[str, Any]] = []
     reference_shapes: Optional[Dict[str, Tuple[int, ...]]] = None
+    optional_shapes: Dict[str, Tuple[int, ...]] = {}
 
     for row in rows:
         scene_id = str(row["scene_id"])
-        status = statuses.get(scene_id)
-        if status not in {"refined", "reused"}:
-            continue
-        input_checkpoint = source_checkpoint_path(
-            dataset_root, old_resolution, scene_id, testset
-        )
-        output_checkpoint = refined_checkpoint_path(
-            dataset_root, old_resolution, scene_id, testset
+        checkpoint = source_checkpoint_path(
+            gs_dataset_root, resolution, scene_id, testset
         )
         try:
             scene_stats, shapes = compute_scene_statistics(
-                input_checkpoint, output_checkpoint, statistics_max_gs_num, statistics_remove_outlier_ndevs
+                checkpoint, statistics_max_gs_num, statistics_remove_outlier_ndevs
             )
+            required_shapes = {
+                key: shape for key, shape in shapes.items()
+                if key not in OPTIONAL_SPLAT_KEYS
+            }
             if reference_shapes is None:
-                reference_shapes = shapes
-            elif shapes != reference_shapes:
+                reference_shapes = required_shapes
+            elif required_shapes != reference_shapes:
                 raise ValueError(
                     "Parameter channel shapes differ from earlier scenes: "
-                    f"{shapes} != {reference_shapes}."
+                    f"{required_shapes} != {reference_shapes}."
                 )
-        except (OSError, RuntimeError, TypeError, ValueError) as exc:
-            statuses[scene_id] = "statistics_failed"
+            for key in OPTIONAL_SPLAT_KEYS:
+                if key in shapes:
+                    if key in optional_shapes and shapes[key] != optional_shapes[key]:
+                        raise ValueError(
+                            f"Optional parameter {key} shape {shapes[key]} differs "
+                            f"from earlier scenes: {optional_shapes[key]}."
+                        )
+                    optional_shapes[key] = shapes[key]
+        except (EOFError, OSError, pickle.UnpicklingError, RuntimeError, TypeError, ValueError) as exc:
             failures.append(
                 {
                     "scene_id": scene_id,
@@ -798,29 +540,10 @@ def calculate_statistics(
             )
             print(f"[ERROR] Statistics failed for {scene_id}: {exc}")
             continue
-        scene_stats["status"] = status
         scenes[scene_id] = scene_stats
 
     aggregate = aggregate_scene_statistics(scenes)
     return scenes, aggregate, failures
-
-
-def existing_refinement_statuses(
-    rows: Sequence[Dict[str, Any]],
-    dataset_root: Path,
-    old_resolution: int,
-    testset: bool = False,
-) -> Dict[str, str]:
-    statuses: Dict[str, str] = {}
-    for row in rows:
-        scene_id = str(row["scene_id"])
-        if refined_checkpoint_path(
-            dataset_root, old_resolution, scene_id, testset
-        ).is_file():
-            statuses[scene_id] = "reused"
-        else:
-            statuses[scene_id] = "not_run"
-    return statuses
 
 
 def write_json(data: Dict[str, Any], path: Path) -> None:
@@ -832,143 +555,82 @@ def write_json(data: Dict[str, Any], path: Path) -> None:
 
 def main() -> int:
     args = parse_args()
-    dataset_root = args.dataset_root.resolve()
-    resolutions = (args.old_resolution, args.new_resolution)
-    train_root = input_objaverse_root(dataset_root, args.testset)
-    if not train_root.is_dir():
-        print(f"[ERROR] Input dataset directory does not exist: {train_root}")
+    image_dataset_root = args.image_dataset_root.resolve()
+    gs_dataset_root = args.gs_dataset_root.resolve()
+    image_root = resolution_root(image_dataset_root, args.resolution, args.testset)
+    gs_root = resolution_root(gs_dataset_root, args.resolution, args.testset)
+    if not (image_root / "colmap").is_dir():
+        print(f"[ERROR] Image directory does not exist: {image_root / 'colmap'}")
+        return 1
+    if not (gs_root / "gsplat").is_dir():
+        print(f"[ERROR] MCMC GS directory does not exist: {gs_root / 'gsplat'}")
         return 1
 
-    metadata_prefix = "test_" if args.testset else ""
-    valid_csv = dataset_root / f"{metadata_prefix}valid_scenes.csv"
-    filtered_csv = dataset_root / f"{metadata_prefix}psnr_filtered_scenes.csv"
-    statistics_json = dataset_root / f"{metadata_prefix}gs_statistics.json"
-    stage_flags_specified = any(
-        (args.scan, args.filter, args.refine, args.statistics)
-    )
-    run_refinement = args.refine or not stage_flags_specified
-    needs_filtered_rows = (
-        args.filter
-        or args.refine
-        or args.statistics
-        or not stage_flags_specified
-    )
+    valid_csv = gs_root / "valid_scenes.csv"
+    filtered_csv = gs_root / "psnr_filtered_scenes.csv"
+    statistics_json = gs_root / "gs_statistics.json"
+    run_all = not any((args.scan, args.filter, args.statistics))
+    run_scan = args.scan or run_all or not valid_csv.is_file()
+    run_filter = args.filter or args.statistics or run_all
+    run_statistics = args.statistics or run_all
 
     invalid_reasons: Counter = Counter()
-    filtered_regenerated = False
-    if args.scan or not valid_csv.is_file():
-        print(f"Scanning paired scenes under {train_root}")
+    if run_scan:
+        print(f"Scanning {args.resolution}px MCMC scenes")
         valid_rows, invalid_reasons = scan_valid_scenes(
-            dataset_root, resolutions, args.testset
+            image_dataset_root, gs_dataset_root, args.resolution, args.testset
         )
-        write_scene_csv(valid_rows, valid_csv, resolutions)
+        write_scene_csv(valid_rows, valid_csv)
         print(f"Wrote {valid_csv}")
     else:
         print(f"Reusing {valid_csv}")
         try:
-            valid_rows = load_scene_csv(valid_csv, resolutions)
+            valid_rows = load_scene_csv(valid_csv)
         except (OSError, ValueError) as exc:
             print(f"[ERROR] Could not reuse valid scene list: {exc}")
             return 1
 
-    print(f"Valid paired scenes: {len(valid_rows)}")
-    if not needs_filtered_rows:
+    print(f"Valid scenes: {len(valid_rows)}")
+    if not run_filter:
         return 0
 
-    if args.filter or not filtered_csv.is_file():
-        filtered_regenerated = True
-        filtered_rows = filter_scenes(
-            valid_rows, args.old_resolution, args.psnr_threshold
-        )
-        write_scene_csv(filtered_rows, filtered_csv, resolutions)
-        print(f"Wrote {filtered_csv}")
-    else:
-        print(f"Reusing {filtered_csv}")
-        try:
-            filtered_rows = load_scene_csv(filtered_csv, resolutions)
-        except (OSError, ValueError) as exc:
-            print(f"[ERROR] Could not reuse filtered scene list: {exc}")
-            return 1
+    filtered_rows = filter_scenes(valid_rows, args.psnr_threshold)
+    write_scene_csv(filtered_rows, filtered_csv)
+    print(f"Wrote {filtered_csv}")
 
     print(
-        f"Scenes with {args.old_resolution}px PSNR >= {args.psnr_threshold}: "
+        f"Scenes with {args.resolution}px PSNR >= {args.psnr_threshold}: "
         f"{len(filtered_rows)}"
     )
-    if stage_flags_specified and not args.refine and not args.statistics:
+    if not run_statistics:
         return 0
 
-    failures: List[Dict[str, Any]] = []
-    if run_refinement:
-        refiner_path = Path(__file__).resolve().with_name("refiner.py")
-        if not refiner_path.is_file():
-            print(f"[ERROR] Refiner does not exist: {refiner_path}")
-            return 1
-        statuses, failures = run_refinements(
-            filtered_rows,
-            dataset_root,
-            args.old_resolution,
-            args.new_resolution,
-            args.gpu_id,
-            args.force,
-            refiner_path,
-            args.testset,
-        )
-    else:
-        statuses = existing_refinement_statuses(
-            filtered_rows, dataset_root, args.old_resolution, args.testset
-        )
-
-    run_statistics = args.statistics or (
-        not stage_flags_specified
-        and (
-            not statistics_json.is_file()
-            or filtered_regenerated
-            or bool(failures)
-            or any(status == "refined" for status in statuses.values())
-        )
-    )
-    if not run_statistics:
-        if not stage_flags_specified and statistics_json.is_file():
-            print(f"Reusing {statistics_json}")
-        return 1 if failures else 0
-
-    scenes, aggregate, statistics_failures = calculate_statistics(
+    scenes, aggregate, failures = calculate_statistics(
         filtered_rows,
-        statuses,
-        dataset_root,
-        args.old_resolution,
+        gs_dataset_root,
+        args.resolution,
         args.testset,
         statistics_max_gs_num=args.statistics_max_gs_num,
         statistics_remove_outlier_ndevs=args.statistics_remove_outlier_ndevs,
     )
-    failures.extend(statistics_failures)
 
-    status_counts = Counter(statuses.values())
     result = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "config": {
-            "dataset_root": str(dataset_root),
-            "input_root": str(train_root),
-            "refined_root": str(refined_objaverse_root(dataset_root, args.testset)),
+            "image_dataset_root": str(image_dataset_root),
+            "gs_dataset_root": str(gs_dataset_root),
             "dataset_split": "test" if args.testset else "train",
-            "old_resolution": args.old_resolution,
-            "new_resolution": args.new_resolution,
+            "resolution": args.resolution,
             "expected_image_count": EXPECTED_IMAGE_COUNT,
             "psnr_threshold": args.psnr_threshold,
-            "psnr_filter_resolution": args.old_resolution,
-            "source_checkpoint_name": SOURCE_CHECKPOINT_NAME,
-            "refined_checkpoint_name": REFINED_CHECKPOINT_NAME,
-            "refiner_steps": REFINER_STEPS,
-            "refiner_batch_size": 4,
-            "refiner_interpolation": False,
-            "difference": "output_minus_input",
+            "checkpoint_name": SOURCE_CHECKPOINT_NAME,
+            "render_metrics_name": SOURCE_STATS_NAME,
             "raw_parameter_space": True,
             "aggregate_weighting": "equal_scene_average",
             "normalized_statistics": {
-                "coordinate_frame": "input_resolution",
                 "feature_range": [0.0, 1.0],
                 "preserve_ratio": True,
-                "scaler_fit": "selected_input_means",
+                "scaler_fit": "selected_means",
                 "max_gs_num": args.statistics_max_gs_num,
                 "remove_outlier_ndevs": args.statistics_remove_outlier_ndevs,
                 "scale_representation": "log_scale_plus_log_coordinate_scale",
@@ -983,7 +645,6 @@ def main() -> int:
             "valid_scenes": len(valid_rows),
             "filtered_scenes": len(filtered_rows),
             "statistics_scenes": len(scenes),
-            "status_counts": dict(sorted(status_counts.items())),
             "failure_count": len(failures),
             "invalid_scene_count": sum(invalid_reasons.values()),
         },
