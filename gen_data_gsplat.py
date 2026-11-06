@@ -165,7 +165,7 @@ def build_render_command(obj_path, obj_output_dir, resolution):
 
 
 def build_train_command(
-    colmap_dir, output_dir, obj_id, max_splats=DEFAULT_MAX_SPLATS
+    colmap_dir, output_dir, obj_id, max_splats=DEFAULT_MAX_SPLATS, max_steps=10000
 ):
     bbox_seed_count = min(max_splats // 2, max_splats)
     train_cmd = [
@@ -178,11 +178,11 @@ def build_train_command(
         '--data-factor=1',
         f'--result-dir={output_dir}',
         '--test-every=-1',
-        '--max-steps=10000',
-        '--eval-steps=10000',
-        '--save-steps=10000',
-        # '--save-ply',
-        # '--ply-steps=15000',
+        f'--max-steps={max_steps}',
+        f'--eval-steps={max_steps}',
+        f'--save-steps={max_steps}',
+        '--save-ply',
+        f'--ply-steps={max_steps}',
         '--alpha-aware',
         '--disable-video',
         '--init-type=sfm',
@@ -192,7 +192,7 @@ def build_train_command(
         '--sh-degree=0',
         '--tb-every=0',
         f'--strategy.cap-max={max_splats}',
-        '--strategy.refine-stop-iter=10000',
+        f'--strategy.refine-stop-iter={max_steps}',
         '--strategy.no-verbose',
     ]
     return train_cmd

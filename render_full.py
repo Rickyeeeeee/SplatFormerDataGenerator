@@ -1056,7 +1056,8 @@ def render_object(
         for line in images_lines:
             f.write(line)
 
-if __name__ == "__main__":
+def main():
+    global args, context, scene, render
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--object_path",
@@ -1181,3 +1182,7 @@ if __name__ == "__main__":
 
     # Render the images
     render_object()
+
+
+if __name__ == "__main__":
+    main()
