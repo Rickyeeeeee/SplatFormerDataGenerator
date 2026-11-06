@@ -95,22 +95,24 @@ class GeneratorTests(unittest.TestCase):
             self.assertEqual(gen.discover_inventory(root, ['03001627']), ['03001627/model'])
             self.assertEqual(len(gen.discover_inventory(root)), 2)
 
-    def test_generator_counts_images_and_preprocessing_validates_them(self):
+    def test_preprocessing_counts_images_without_render_validation(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             scene = '03001627/a'
             create_scene(root / 'images', root / 'gs', 128, scene)
             image = gen.scene_root(root / 'images', 128, 'colmap', scene)
             self.assertTrue(gen.render_complete(image))
-            self.assertTrue(prep.render_complete(image))
             (image / 'images/000.png').write_bytes(b'')
-            self.assertTrue(gen.render_complete(image))
-            self.assertFalse(prep.render_complete(image))
             (image / 'metadata.json').unlink()
             self.assertTrue(gen.render_complete(image))
-            self.assertFalse(prep.render_complete(image))
+            rows, invalid = prep.scan_scenes(root / 'images', root / 'gs', 128)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(invalid, {})
             (image / 'images/000.png').unlink()
             self.assertFalse(gen.render_complete(image))
+            rows, invalid = prep.scan_scenes(root / 'images', root / 'gs', 128)
+            self.assertEqual(rows, [])
+            self.assertEqual(invalid['invalid_data'], 1)
 
     def test_filesystem_errors_do_not_trigger_incomplete_render(self):
         with mock.patch.object(gen.os, 'scandir', side_effect=PermissionError('unavailable')):

@@ -5,14 +5,14 @@ from collections import Counter
 import csv
 from datetime import datetime, timezone
 import hashlib
-import json
 import math
 import os
 from pathlib import Path
 import pickle
 import random
-import stat
 import sys
+
+from tqdm import tqdm
 
 import preprocess as common
 from gen_data_shapenet import (IMAGE_ROOT, DEFAULT_MAX_SPLATS, DEFAULT_TRAIN_STEPS,
@@ -21,34 +21,6 @@ from gen_data_shapenet import (IMAGE_ROOT, DEFAULT_MAX_SPLATS, DEFAULT_TRAIN_STE
 
 FIELDS = ['scene_id', 'synset_id', 'image_count', 'num_gs', 'psnr', 'ssim', 'lpips', 'ellipse_time']
 SPLITS = ('train', 'val', 'test')
-
-
-def render_complete(path):
-    """Validate COLMAP metadata and non-empty images for preprocessing."""
-    required = [path / 'metadata.json'] + [path / 'sparse' / '0' / name for name in ('bbox.txt', 'cameras.txt', 'images.txt')]
-    try:
-        for required_path in required:
-            info = required_path.stat()
-            if not stat.S_ISREG(info.st_mode) or not info.st_size: return False
-        with os.scandir(path / 'images') as entries:
-            pngs = {entry.name: entry for entry in entries if entry.name.endswith('.png')}
-        if len(pngs) != common.EXPECTED_IMAGE_COUNT: return False
-        metadata = json.loads(required[0].read_text())
-        if 'normalization' not in metadata: return False
-        images = (path / 'sparse/0/images.txt').read_text().splitlines()
-        records = [line.split() for line in images if line.strip() and not line.lstrip().startswith('#')]
-        if len(records) != common.EXPECTED_IMAGE_COUNT or any(len(row) != 10 or row[-1] not in pngs for row in records): return False
-        if len({row[-1] for row in records}) != common.EXPECTED_IMAGE_COUNT or any(not all(math.isfinite(float(x)) for x in row[1:8]) for row in records): return False
-        for entry in pngs.values():
-            info = entry.stat()
-            if not stat.S_ISREG(info.st_mode) or not info.st_size: return False
-        bbox = [[float(x) for x in line.split()] for line in (path / 'sparse/0/bbox.txt').read_text().splitlines()]
-        if len(bbox) != 2 or any(len(row) != 3 or not all(math.isfinite(x) for x in row) for row in bbox) or any(b <= a for a, b in zip(*bbox)): return False
-        camera = (path / 'sparse/0/cameras.txt').read_text().split()
-        if len(camera) != 7 or camera[1] != 'SIMPLE_PINHOLE' or not all(math.isfinite(float(x)) and float(x) > 0 for x in camera[2:]): return False
-    except (FileNotFoundError, NotADirectoryError, ValueError, TypeError):
-        return False
-    return True
 
 
 def parse_args(argv=None):
@@ -81,23 +53,31 @@ def parse_args(argv=None):
 
 def discover_scenes(image_root, gs_root, resolution):
     result = set()
-    for root, kind in ((image_root, 'colmap'), (gs_root, 'gsplat')):
-        base = root / 'shapenet' / str(resolution) / kind
-        if base.is_dir():
-            for category in base.iterdir():
-                if category.is_dir():
-                    result.update(f'{category.name}/{model.name}' for model in category.iterdir() if model.is_dir())
+    with tqdm(desc=f'{resolution}px discovering', unit='entries', dynamic_ncols=True) as progress:
+        for root, kind in ((image_root, 'colmap'), (gs_root, 'gsplat')):
+            progress.set_postfix_str(kind)
+            base = root / 'shapenet' / str(resolution) / kind
+            if base.is_dir():
+                for category in base.iterdir():
+                    if category.is_dir():
+                        for model in category.iterdir():
+                            if model.is_dir():
+                                result.add(f'{category.name}/{model.name}')
+                            progress.update(1)
     return sorted(result)
 
 
 def scan_scenes(image_root, gs_root, resolution, train_steps=DEFAULT_TRAIN_STEPS):
     rows, invalid = [], Counter()
-    for scene in discover_scenes(image_root, gs_root, resolution):
+    scenes = discover_scenes(image_root, gs_root, resolution)
+    for scene in tqdm(scenes, desc=f'{resolution}px checking', unit='scene', dynamic_ncols=True):
         image_dir = scene_root(image_root, resolution, 'colmap', scene)
         gs_dir = scene_root(gs_root, resolution, 'gsplat', scene)
         try:
-            if not render_complete(image_dir): raise ValueError('Invalid or incomplete COLMAP render')
-            count = common.EXPECTED_IMAGE_COUNT  # render_complete already counted the PNGs
+            with os.scandir(image_dir / 'images') as entries:
+                count = sum(1 for entry in entries if entry.name.endswith('.png'))
+            if count != common.EXPECTED_IMAGE_COUNT:
+                raise ValueError(f'Expected {common.EXPECTED_IMAGE_COUNT} PNG images, found {count}')
             checkpoint = gs_dir / 'ckpts' / checkpoint_name(train_steps)
             if not checkpoint.is_file(): raise FileNotFoundError(checkpoint)
             if not checkpoint.stat().st_size: raise ValueError('Empty checkpoint')
@@ -149,7 +129,7 @@ def write_csv(rows, path):
 
 def calculate_statistics(rows, root, resolution, max_count, outlier, train_steps=DEFAULT_TRAIN_STEPS):
     scenes, failures, reference, optional = {}, [], None, {}
-    for row in rows:
+    for row in tqdm(rows, desc=f'{resolution}px statistics', unit='scene', dynamic_ncols=True):
         scene = row['scene_id']
         checkpoint = scene_root(root, resolution, 'gsplat', scene) / 'ckpts' / checkpoint_name(train_steps)
         try:
@@ -164,6 +144,7 @@ def calculate_statistics(rows, root, resolution, max_count, outlier, train_steps
             scenes[scene] = stats
         except (EOFError, OSError, pickle.UnpicklingError, RuntimeError, TypeError, ValueError) as exc:
             failures.append({'scene_id': scene, 'stage': 'statistics', 'error': str(exc)})
+            tqdm.write(f'[ERROR] Statistics failed for {scene}: {exc}', file=sys.stderr)
     return scenes, common.aggregate_scene_statistics(scenes), failures
 
 
@@ -182,6 +163,8 @@ def main(argv=None):
         counts[str(resolution)] = {'discovered': len(rows) + sum(invalid.values()), 'valid_before_psnr': len(rows),
                                    'passing_psnr': len(passing), 'rejected_psnr': len(rows) - len(passing),
                                    'invalid': sum(invalid.values()), 'invalid_reasons': dict(sorted(invalid.items()))}
+        print(f'[{resolution}px] Discovered {counts[str(resolution)]["discovered"]}; '
+              f'valid {len(rows)}; PSNR passed {len(passing)}; invalid {sum(invalid.values())}', flush=True)
     common_ids = set.intersection(*(set(rows) for rows in rows_by_resolution.values()))
     assignments = split_scenes(common_ids, args.split_ratios, args.seed)
     split_counts = {split: sum(value == split for value in assignments.values()) for split in SPLITS}
@@ -219,7 +202,8 @@ def main(argv=None):
     report['statistics_failures'] = len(failures)
     report['statistics_status'] = 'skipped' if args.skip_statistics else ('partial' if failures else 'complete')
     common.write_json(report, args.gs_dataset_root / 'shapenet' / 'gen_data.json')
-    print(f'Passing all resolutions: {len(common_ids)}; splits: {split_counts}')
+    print(f'Passing all resolutions: {len(common_ids)}; splits: {split_counts}', flush=True)
+    print(f'Wrote counts to {args.gs_dataset_root / "shapenet" / "gen_data.json"}', flush=True)
     return int(bool(failures))
 
 

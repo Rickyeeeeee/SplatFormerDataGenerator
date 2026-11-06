@@ -177,8 +177,8 @@ simultaneous writers. Failures are appended to `shapenet_failures.jsonl` in the
 image root. Re-running skips complete renders and checkpoints.
 
 Resume checks count PNG names and check for the requested gsplat checkpoint.
-They do not check image sizes or require render metrics. Preprocessing validates
-the COLMAP metadata, image files, and render metrics separately.
+They do not check image sizes or require render metrics. Preprocessing also
+counts PNG names and checks the checkpoint and render metrics for filtering.
 
 The default is 128 views at 128 × 128, 15,000 training iterations and at most
 4,096 splats. Use `--resolutions 256 128` to render the largest and downscale
@@ -193,6 +193,9 @@ Preprocess the generated pool to filter scenes and replace the split CSVs:
 python preprocess_shapenet.py --strategy default --resolutions 128 \
   --split-ratios 0.9 0.05 0.05 --seed 42
 ```
+
+Preprocessing displays progress bars for discovery, scene checks, and training
+checkpoint statistics, followed by per-resolution counts and the report path.
 
 When using multiple resolutions, a scene must pass the completeness and PSNR
 checks at every selected resolution. It receives the same split at each
