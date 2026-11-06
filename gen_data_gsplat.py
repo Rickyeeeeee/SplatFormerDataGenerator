@@ -236,7 +236,7 @@ def write_scaled_camera_file(source_camera_path, target_camera_path, scale):
     target_camera_path.write_text('\n'.join(output_lines) + '\n', encoding='utf-8')
 
 
-def downscale_scene(source_colmap_dir, target_colmap_dir, source_resolution, target_resolution):
+def downscale_scene(source_colmap_dir, target_colmap_dir, source_resolution, target_resolution, runner=None):
     """Build a lower-resolution COLMAP dataset from a native render."""
     source_images_dir = source_colmap_dir / 'images'
     target_images_dir = target_colmap_dir / 'images'
@@ -259,7 +259,10 @@ def downscale_scene(source_colmap_dir, target_colmap_dir, source_resolution, tar
             '-frames:v', '1', '-update', '1',
             str(target_image),
         ]
-        subprocess.run(ffmpeg_cmd, check=True)
+        if runner is None:
+            subprocess.run(ffmpeg_cmd, check=True)
+        else:
+            runner(ffmpeg_cmd)
 
     source_sparse_dir = source_colmap_dir / 'sparse' / '0'
     target_sparse_dir = target_colmap_dir / 'sparse' / '0'

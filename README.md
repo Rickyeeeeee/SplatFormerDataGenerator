@@ -150,72 +150,123 @@ Note that when generating the input 3DGS for SplatFormer, we stop the optimizati
 
 ### ShapeNetCore v2: gsplat data generation
 
-Extract each category without moving its OBJ, MTL, or textures. The driver
-expects `/project/ricky/ShapeNetCore/<synset>/<model_id>/models/model_normalized.obj`.
-Synsets are eight-character strings; for example, `03001627` is chair.
-The default image root is `/project/ricky/shapenet-sr-data`, and the default
-gsplat root is `/project/ricky/shapenet-sr-data-mcmc-4096`. The driver renders
-128 views at 128 × 128 and trains with a maximum of 4096 splats by default.
-Override roots, resolutions, Blender, GPU and maximum splats with command-line
-options (`python gen_data_shapenet.py --help`).
-
-Select the capped default strategy with `--strategy default`; its default
-output root is `/project/ricky/shapenet-sr-data-default-4096`. Pass the same
-strategy to preprocessing. The root automatically reflects `--max-splats`
-for either strategy; pass the same cap to preprocessing, or override the root
-explicitly with `--gs-dataset-root` in both commands. MCMC remains the default.
-The default strategy's cap requires the compatible gsplat version installed in
-the `srdatagenerator` environment.
-
-```bash
-python gen_data_shapenet.py --strategy default --categories 03001627 --split train --limit 1
-python preprocess_shapenet.py --strategy default --split train
-```
-
-For a one-model chair pilot (requires Blender, a CUDA GPU, and the gsplat
-training environment):
-
-```bash
-python gen_data_shapenet.py --categories 03001627 --split train --limit 1 --gpu-id 0
-python preprocess_shapenet.py --split train
-```
-
-Use `--skip-gs` to render only, or add `--resolutions 256 128` to render the
-largest size and downscale the rest. `--split val` and `--split test` select
-other model splits. The scene limit applies after category and split filters;
-it does not change the manifest or its assignment of all discovered models.
-
-Use `--train-steps` to change the 15,000-iteration default, and pass the same
-value to preprocessing. For example:
-
-```bash
-python gen_data_shapenet.py --categories 03001627 --split train --limit 1 --train-steps 2000
-python preprocess_shapenet.py --split train --train-steps 2000
-```
-
-The trainer uses zero-based step numbers, so this example saves
-`ckpt_1999_rank0.pt` and `val_step1999.json`. For non-default iteration counts,
-preprocessing includes the final step in its output filenames (for example,
-`valid_scenes_step1999.csv`) to keep results from different runs separate.
-
-The driver writes `<image-root>/shapenet_splits.json` with a seed, complete
-model inventory and category-stratified 90/5/5 assignments. It detects added or
-removed model directories and requires an explicit `--rebuild-manifest` to
-reassign them. Rebuilding is refused if a scene would move splits while its old
-outputs still exist; relocate or remove those outputs deliberately first.
-Failures are appended to `<image-root>/shapenet_failures.jsonl`; rerunning retries
-them. Incomplete render directories are replaced before retrying.
-
-Images and gsplat results use separate roots and the same category hierarchy:
+Extract models under `/project/ricky/ShapeNetCore/<synset>/<model_id>/models/`,
+including their OBJ, MTL, and texture files. The image and gsplat roots default
+to `/project/ricky/shapenet-sr-data` and
+`/project/ricky/shapenet-sr-data-mcmc-4096`. Outputs are independent of data
+splits and follow this layout:
 
 ```text
-<root>/<train|val|test>-set/shapenet/<resolution>/<colmap|gsplat>/<synset>/<model_id>/
+<root>/shapenet/<resolution>/<colmap|gsplat>/<synset>/<model_id>/
 ```
 
-Preprocessing creates `valid_scenes.csv`, `psnr_filtered_scenes.csv` and
-`gs_statistics.json` under the gsplat resolution directory. Both CSVs retain
-`scene_id` (`synset/model_id`) and `synset_id`. The preprocessing script accepts
-`--scan`, `--filter`, and `--statistics` like `preprocess.py`; see `--help` for
-root and threshold overrides. This renderer uses Blender's ShapeNet OBJ axis
-conversion and keeps semantic orientation instead of the legacy renderer's
-shortest-side rotation, so its outputs differ from the older ShapeNet scripts.
+Use the `srdatagenerator` environment for the installed capped gsplat strategy.
+For example, process the chair category on two GPUs with two scenes per GPU:
+
+```bash
+conda activate srdatagenerator
+python gen_data_shapenet.py --strategy default --categories 03001627 \
+  --gpu-ids 0 1 --scenes-per-gpu 2
+```
+
+GPU IDs are physical NVIDIA indices and must be visible in any existing
+`CUDA_VISIBLE_DEVICES` setting. Without GPU options, one idle visible GPU is
+selected. `--gpu-id 0` selects one GPU; `--limit 1` processes one model for a
+pilot. Each scene remains on one GPU, and per-scene file locks prevent
+simultaneous writers. Failures are appended to `shapenet_failures.jsonl` in the
+image root. Re-running skips complete renders and checkpoints.
+
+Resume checks count PNG names and check for the requested gsplat checkpoint.
+They do not check image sizes or require render metrics. Preprocessing validates
+the COLMAP metadata, image files, and render metrics separately.
+
+The default is 128 views at 128 × 128, 15,000 training iterations and at most
+4,096 splats. Use `--resolutions 256 128` to render the largest and downscale
+others, `--train-steps` to change training length, and `--skip-gs` to render
+only. MCMC is the default; `--strategy default` uses the capped DefaultStrategy
+and the root `/project/ricky/shapenet-sr-data-default-4096`. The default root
+reflects `--strategy` and `--max-splats`; either root can be explicitly set.
+
+Preprocess the generated pool to filter scenes and replace the split CSVs:
+
+```bash
+python preprocess_shapenet.py --strategy default --resolutions 128 \
+  --split-ratios 0.9 0.05 0.05 --seed 42
+```
+
+When using multiple resolutions, a scene must pass the completeness and PSNR
+checks at every selected resolution. It receives the same split at each
+resolution. `<gsplat-root>/shapenet/<resolution>/train_scenes.csv`,
+`val_scenes.csv`, and `test_scenes.csv` contain scene IDs, category IDs, and
+metrics. Aggregate statistics in `gs_statistics.json` are calculated only from
+the training split. Add `--skip-statistics` to generate only the split CSVs and
+counts; the statistics file is marked as skipped so old statistics are not
+mistaken for the new split. Use the same `--strategy`, `--max-splats`, `--train-steps`, and root
+options as generation. Splits are regenerated on every invocation.
+
+`<gsplat-root>/shapenet/gen_data.json` records discovered, valid, PSNR-passing,
+PSNR-rejected and invalid counts per resolution, the number passing at every
+resolution, split counts, and the preprocessing configuration.
+
+#### Copy outputs from the old split layout
+
+Stop any generators using the old layout before copying. First check for scene
+directory collisions across old splits or in the new destination:
+
+```bash
+python - <<'CHECK'
+from pathlib import Path
+import sys
+
+datasets = [
+    (Path('/project/ricky/shapenet-sr-data'), 'colmap'),
+    (Path('/project/ricky/shapenet-sr-data-default-4096'), 'gsplat'),
+]
+collisions = []
+for root, kind in datasets:
+    seen = {}
+    for prefix in ('train-set/shapenet', 'val-set/shapenet', 'test-set/shapenet', 'shapenet'):
+        base = root / prefix
+        if not base.is_dir():
+            continue
+        for scene in base.glob(f'*/{kind}/*/*'):
+            if not scene.is_dir():
+                continue
+            key = (scene.parents[2].name, scene.parent.name, scene.name)
+            if key in seen:
+                collisions.append((seen[key], scene))
+            else:
+                seen[key] = scene
+if collisions:
+    for first, second in collisions:
+        print(f'Collision: {first}\n           {second}')
+    sys.exit('Resolve these collisions before copying.')
+print('No scene-directory collisions found.')
+CHECK
+```
+
+If there are no collisions, copy the data. This preserves the original files:
+
+```bash
+for pair in \
+  '/project/ricky/shapenet-sr-data:colmap' \
+  '/project/ricky/shapenet-sr-data-default-4096:gsplat'
+do
+  root="${pair%:*}"
+  kind="${pair##*:}"
+  for split in train-set val-set test-set
+  do
+    for resolution_dir in "$root/$split/shapenet/"*/
+    do
+      [ -d "$resolution_dir/$kind" ] || continue
+      resolution="$(basename "$resolution_dir")"
+      mkdir -p "$root/shapenet/$resolution/$kind"
+      rsync -a --ignore-existing \
+        "$resolution_dir/$kind/" "$root/shapenet/$resolution/$kind/"
+    done
+  done
+done
+```
+
+Verify the copies before deleting any old directories. Repeat for other gsplat
+strategy roots if needed.

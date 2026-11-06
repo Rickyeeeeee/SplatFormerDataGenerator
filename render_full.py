@@ -1175,10 +1175,15 @@ def main():
     scene.cycles.use_adaptive_sampling = True
     scene.cycles.use_denoising = True
     scene.render.film_transparent = True
-    bpy.context.preferences.addons["cycles"].preferences.get_devices()
-    bpy.context.preferences.addons[
-        "cycles"
-    ].preferences.compute_device_type = "CUDA"  # or "OPENCL"
+    if args.use_gpu:
+        preferences = bpy.context.preferences.addons["cycles"].preferences
+        preferences.compute_device_type = "CUDA"
+        preferences.get_devices()
+        cuda_devices = [device for device in preferences.devices if device.type == "CUDA"]
+        if not cuda_devices:
+            raise RuntimeError("No CUDA device available to Blender")
+        for device in preferences.devices:
+            device.use = device.type == "CUDA"
 
     # Render the images
     render_object()
