@@ -211,6 +211,46 @@ options as generation. Splits are regenerated on every invocation.
 PSNR-rejected and invalid counts per resolution, the number passing at every
 resolution, split counts, and the preprocessing configuration.
 
+#### Train noise-to-GS on ShapeNet
+
+Run preprocessing as above without `--skip-statistics` before training. The
+config `configs/dataset/shapenet-sr.gin` uses the filtered train and test CSVs,
+training statistics, and separate image and checkpoint roots. Override
+`dataset_root`, `shapenet_gs_root`, the CSV paths, and
+`flow_matching.gs_statistics_path` for other roots. Both resolutions are 128;
+the source checkpoint is still read to normalize the coordinate frame.
+Set `SplatFactoSRDataset.image_dataset_root` to override the image root
+independently; it defaults to `dataset_root` in the ShapeNet layout.
+
+From the repository root, choose a scene ID from `test_scenes.csv` and run:
+
+```bash
+SCENE='03001627/<model-id>'
+python overfit-noise-to-gs.py --scene_name="$SCENE" \
+  --gin_file=configs/model/dit_gaussian.gin \
+  --gin_file=configs/dataset/shapenet-sr.gin \
+  --gin_file=configs/overfit/noise_to_gs.gin \
+  --gin_param='SplatFactoSRDataset.max_gs_num=1000'
+```
+
+For distributed training, point both checkpoint directory flags at the
+unsplit gsplat directory and select an evaluation scene from the test CSV:
+
+```bash
+GS_DIR=/project/ricky/shapenet-sr-data-default-4096/shapenet/128/gsplat
+torchrun --standalone --nproc_per_node=1 train-noise-to-gs.py \
+  --train_splat_dir="$GS_DIR" --test_splat_dir="$GS_DIR" --eval_scene_name="$SCENE" \
+  --gin_file=configs/model/dit_gaussian.gin \
+  --gin_file=configs/dataset/shapenet-sr.gin \
+  --gin_file=configs/train/noise_to_gs.gin
+```
+
+To evaluate against the validation split instead, add
+`--gin_param="test_dataset/SplatFactoSRDataset.test_scene_list='/project/ricky/shapenet-sr-data-default-4096/shapenet/128/val_scenes.csv'"`
+and choose a scene from that file. Overfit checkpoint root overrides point to
+the dataset root, whereas the distributed trainer's `*_splat_dir` flags point
+directly to the resolution's `gsplat` directory.
+
 #### Copy outputs from the old split layout
 
 Stop any generators using the old layout before copying. First check for scene
